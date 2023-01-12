@@ -12,11 +12,11 @@
 
 非交互式的证明允许证明者让验证者确信某个陈述是正确的。近来我们看到很多理论和实践上的进展，关于构建高效率的、证明体积小的、验证简单的非交互式证明，它们被称为SNARGs和SNARKs。很多SNARGs方案都基于配对的加密方案（注：PBC，大部分是基于椭圆曲线的配对方案，这里可以简单理解SNARGs为类似ECC签名生成和验证的东西）构建。在这些构建中，一个证明通常包含多个群元素，而验证则通常检查多个配对的乘积等式。我们在这篇文章中关注的问题，是基于配对的SNARGs方案效率到底能有多高。我们的第一个贡献是提出一个基于配对的、有预设的SNARK方案，使用算数电路的可满足性进行验证，是一种NP完备的语言表述。在我们的SNARK方案中，我们使用非对称配对来提高效率，一个证明仅包含三个群元素，并且验证也使用三个独立配对的乘积等式。我们的SNARK是零知识的，在生成证明的时候不暴露证明者提供的证据的任何信息。
 
-简要来说，Groth16的SNARK是有预设的、基于电路的、NP完备的、使用非对称加密的零知识证明方案。这里简单转载一下[其他人的Groth16论文翻译](./Groth16%20%E5%AD%A6%E4%B9%A0%E7%AC%94%E8%AE%B0_mutourend%E7%9A%84%E5%8D%9A%E5%AE%A2.pdf)和[解读](./%E6%8A%80%E6%9C%AF%E8%A7%A3%E6%9E%90%E7%83%AD%E9%97%A8%E9%9B%B6%E7%9F%A5%E8%AF%86%E8%AF%81%E6%98%8E%E6%96%B9%E6%A1%88%20Groth16-%E6%AF%94%E7%89%B9%E5%B8%81%E8%A1%8C%E6%83%85.pdf)。
+简要来说，Groth16的SNARK是有预设的、基于电路的、NP完备的、使用非对称加密的零知识证明方案。这里简单引用一下其他人的Groth16[论文翻译](https://blog.csdn.net/mutourend/article/details/116405240)和[论文解读](https://www.btchangqing.cn/185490.html)，仓库内也可以找到Groth16的[分析推导](./groth16%E6%96%B9%E6%A1%88%E5%88%86%E6%9E%90.pdf)。
 
 ## NILP和Non-Interactive Argument
 
-抛开前半段从R1CS到QAP的转换过程，略过NILP的定义，我们直接关注non-interactive zero-knowledge arguments of knowledge的四个算法和它们的输入输出：
+抛开前半段从R1CS到QAP的转换过程，略过NILP（Non-Interactive Linear Proofs）的定义，我们直接关注NIZK（Non-Interactive Zero-Knowledge）的四个算法和它们的输入输出：
 
 0. 定义$\mathbb{R}$是一个关系生成器，输入安全参数，输出一个多项式时间内能够计算的二元映射关系$R$；
 1. Setup算法，输入为relation $R$，输出为common reference string $\sigma$和相应的simulation trapdoor $\tau$；

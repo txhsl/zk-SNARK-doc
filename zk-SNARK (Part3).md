@@ -1,6 +1,6 @@
 # zk-SNARK (Part3)
 
-接上文，我们已经介绍了Groth16的定义，包括参数的预设、证明的生成、验证，以及复现论据的模拟过程。接下来，我们先从Zcash的Sprout和Sapling协议入手，看一看Zcash如何实现zk-SNARK。
+接上文，我们已经介绍了Groth16的定义，包括参数的预设、证明的生成、验证，以及复现论据的模拟过程。接下来，我们先从Zcash的Sprout和Sapling协议入手，看一看Zcash如何实现zk-SNARK和隐匿交易。
 
 Zcash中的zk-SNARK总是证明两件事：
 
@@ -8,6 +8,8 @@ Zcash中的zk-SNARK总是证明两件事：
 2. Prover铸造了某个有效的Note给目标地址。
 
 ## Sprout证明
+
+我们按照从下往上的顺序，先看最为基础的JoinSplit数据结构和Zcash在隐匿交易中完成的证明。
 
 ### zcash入口
 
@@ -1370,6 +1372,8 @@ impl<S: PrimeField> ConstraintSystem<S> for ProvingAssignment<S> {
 
 ## 交易构建
 
+在上面的证明部分，我们已经知道了JoinSplit的结构组成，以及Proof证明的具体内容，接下来这部分内容将具体描述Zcash节点如何从RPC指令的参数中构建Sprout交易以及如何处理Sprout Merkel Tree。
+
 直接上Zcash的交易结构定义，在[zcash/zcash/src/primitives/transaction.h](https://github.com/zcash/zcash/blob/master/src/primitives/transaction.h#L703)，
 
 ```cpp
@@ -1525,6 +1529,7 @@ unsigned char joinSplitPrivKey[crypto_sign_SECRETKEYBYTES];
 crypto_sign_keypair(mtx.joinSplitPubKey.begin(), joinSplitPrivKey);
 
 // Create Sprout JSDescriptions
+// 每个JoinSplit只能处理两个input和两个output，所以有时需要构建多个JoinSplit
 if (!jsInputs.empty() || !jsOutputs.empty()) {
     try {
         CreateJSDescriptions();
@@ -1535,6 +1540,23 @@ if (!jsInputs.empty() || !jsOutputs.empty()) {
         librustzcash_sapling_proving_ctx_free(ctx);
         throw e;
     }
+}
+
+// ......
+
+//
+// Signatures
+//
+auto consensusBranchId = CurrentEpochBranchId(nHeight, consensusParams);
+
+// Empty output script.
+uint256 dataToBeSigned;
+CScript scriptCode;
+try {
+    dataToBeSigned = SignatureHash(scriptCode, mtx, NOT_AN_INPUT, SIGHASH_ALL, 0, consensusBranchId);
+} catch (std::logic_error ex) {
+    librustzcash_sapling_proving_ctx_free(ctx);
+    return TransactionBuilderResult("Could not construct signature hash: " + std::string(ex.what()));
 }
 
 // ......
@@ -1579,6 +1601,7 @@ void TransactionBuilder::CreateJSDescriptions()
     // 当JoinSplit的input数量为0，则vpub_old = outputs[0].value + outputs[1].value,
     // 意味着发送者从自己的公开资产销毁vpub_old，并将等量的隐匿资产铸造到Sprout资金池
     // vpub_old是公开的，所以会称泄露了output value的总量信息
+    // 这里不需要处理note的销毁，逻辑相对简单
     if (jsInputs.empty()) {
         // Create joinsplits, where each output represents a zaddr recipient.
         while (jsOutputsDeque.size() > 0) {
@@ -1604,6 +1627,7 @@ void TransactionBuilder::CreateJSDescriptions()
 
     // At this point, we are guaranteed to have at least one input note.
     // Use address of first input note as the temporary change address.
+    // 而当存在至少一个input时，先将第一个input的来源地址取为临时地址
     auto changeKey = jsInputsDeque.front().key;
     auto changeAddress = changeKey.address();
 
@@ -1612,6 +1636,7 @@ void TransactionBuilder::CreateJSDescriptions()
     bool vpubOldProcessed = false; // updated when vpub_old for taddr inputs is set in first joinsplit
     bool vpubNewProcessed = false; // updated when vpub_new for miner fee and taddr outputs is set in last joinsplit
 
+    // 计算隐私输入value减隐私输出value后的剩余值
     CAmount valueOut = 0;
     for (auto jsInput : jsInputs) {
         valueOut += jsInput.note.value();
@@ -1619,13 +1644,16 @@ void TransactionBuilder::CreateJSDescriptions()
     for (auto jsOutput : jsOutputs) {
         valueOut -= jsOutput.value;
     }
+    // valueOut为负时，input数量不足，将vpub_old置为非零；反之output数量不足，将vpub_new置为非零
     CAmount vpubOldTarget = valueOut < 0 ? -valueOut : 0;
     CAmount vpubNewTarget = valueOut > 0 ? valueOut : 0;
 
     // Keep track of treestate within this transaction
+    // 记录当前的SproutMerkleTree树状态
     boost::unordered_map<uint256, SproutMerkleTree, CCoinsKeyHasher> intermediates;
     std::vector<uint256> previousCommitments;
 
+    // 当，当前处理的JoinSplit不是交易中最后一个JoinSplit，时
     while (!vpubNewProcessed) {
         // Default array entries are dummy inputs and outputs
         std::array<libzcash::JSInput, ZC_NUM_JS_INPUTS> vjsin;
@@ -1634,11 +1662,13 @@ void TransactionBuilder::CreateJSDescriptions()
         uint64_t vpub_new = 0;
 
         // Set vpub_old in the first joinsplit
+        // 当，当前处理的JoinSplit是交易中第一个JoinSplit时，处理vpub_old
         if (!vpubOldProcessed) {
             vpub_old += vpubOldTarget; // funds flowing from public pool
             vpubOldProcessed = true;
         }
 
+        // 处理state anchor
         CAmount jsInputValue = 0;
         uint256 jsAnchor;
 
@@ -1650,6 +1680,7 @@ void TransactionBuilder::CreateJSDescriptions()
         }
 
         // If there is no change, the chain has terminated so we can reset the tracked treestate.
+        // 若之前的JoinSplit没有未处理完的余额，则清理掉缓存
         if (jsChange == 0 && mtx.vJoinSplit.size() > 0) {
             intermediates.clear();
             previousCommitments.clear();
@@ -1658,8 +1689,10 @@ void TransactionBuilder::CreateJSDescriptions()
         //
         // Consume change as the first input of the JoinSplit.
         //
+        // 若之前的JoinSplit有未处理完的余额，则将上一个JoinSplit铸造的零钱output作为自己的第一个input
         if (jsChange > 0) {
             // Update tree state with previous joinsplit
+            // 找到上一个JoinSplit锚定的初始树状态
             SproutMerkleTree tree;
             {
                 // assert that coinsView is not null
@@ -1679,6 +1712,7 @@ void TransactionBuilder::CreateJSDescriptions()
             assert(changeOutputIndex < prevJoinSplit.commitments.size());
             boost::optional<SproutWitness> changeWitness;
             int n = 0;
+            // 将上一个JoinSplit新加的commitment加入树中，取出见证后的witness
             for (const uint256& commitment : prevJoinSplit.commitments) {
                 tree.append(commitment);
                 previousCommitments.push_back(commitment);
@@ -1689,6 +1723,7 @@ void TransactionBuilder::CreateJSDescriptions()
                 }
             }
             assert(changeWitness.has_value());
+            // 将上一个JoinSplit更改后的树状态记录为自己的锚定状态
             jsAnchor = tree.root();
             intermediates.insert(std::make_pair(tree.root(), tree)); // chained js are interstitial (found in between block boundaries)
 
@@ -1696,6 +1731,7 @@ void TransactionBuilder::CreateJSDescriptions()
             ZCNoteDecryption decryptor(changeKey.receiving_key());
             auto hSig = prevJoinSplit.h_sig(*sproutParams, mtx.joinSplitPubKey);
             try {
+                // 取出零钱output位置的note数据
                 auto plaintext = libzcash::SproutNotePlaintext::decrypt(
                     decryptor,
                     prevJoinSplit.ciphertexts[changeOutputIndex],
@@ -1703,6 +1739,7 @@ void TransactionBuilder::CreateJSDescriptions()
                     hSig,
                     (unsigned char)changeOutputIndex);
 
+                // 将未使用完的零钱作为当前JoinSplit的input[0]
                 auto note = plaintext.note(changeAddress);
                 vjsin[0] = libzcash::JSInput(changeWitness.get(), note, changeKey);
 
@@ -1718,11 +1755,14 @@ void TransactionBuilder::CreateJSDescriptions()
         //
         // Consume spendable non-change notes
         //
+        // 正式处理当前JoinSplit的数据，如果继承了零钱，则有两个input需要处理
         for (int n = (jsChange > 0) ? 1 : 0; n < ZC_NUM_JS_INPUTS && jsInputsDeque.size() > 0; n++) {
+            // 取出input队列的第一个，作为当前JoinSplit将要处理的对象
             auto jsInput = jsInputsDeque.front();
             jsInputsDeque.pop_front();
 
             // Add history of previous commitments to witness
+            // 如果继承零钱，则JoinSplit的anchor root为上一个JoinSplit的终结状态
             if (jsChange > 0) {
                 for (const uint256& commitment : previousCommitments) {
                     jsInput.witness.append(commitment);
@@ -1733,6 +1773,7 @@ void TransactionBuilder::CreateJSDescriptions()
             }
 
             // The jsAnchor is null if this JoinSplit is at the start of a new chain
+            // 如果不继承零钱，则JoinSplit的anchor root为input note见证后的树状态
             if (jsAnchor.IsNull()) {
                 jsAnchor = jsInput.witness.root();
             }
@@ -1744,17 +1785,21 @@ void TransactionBuilder::CreateJSDescriptions()
         // Find recipient to transfer funds to
         libzcash::JSOutput recipient;
         if (jsOutputsDeque.size() > 0) {
+            // 取出output队列的第一个，作为当前JoinSplit将要处理的对象
             recipient = jsOutputsDeque.front();
             jsOutputsDeque.pop_front();
         }
         // `recipient` is now either a valid recipient, or a dummy output with value = 0
 
         // Reset change
+        // 重置零钱标记
         jsChange = 0;
+        // outAmount可以是一个值（有确切接收对象）或者零（全部output都已经处理完了）
         CAmount outAmount = recipient.value;
 
         // Set vpub_new in the last joinsplit (when there are no more notes to spend or zaddr outputs to satisfy)
         if (jsOutputsDeque.empty() && jsInputsDeque.empty()) {
+            // 当全部input和output处理完成，处理vpub_new
             assert(!vpubNewProcessed);
             if (jsInputValue < vpubNewTarget) {
                 throw JSDescException(strprintf("Insufficient funds for vpub_new %s", FormatMoney(vpubNewTarget)));
@@ -1766,6 +1811,7 @@ void TransactionBuilder::CreateJSDescriptions()
             assert(jsChange >= 0);
         } else {
             // This is not the last joinsplit, so compute change and any amount still due to the recipient
+            // 否则尝试满足recipient.value，若jsInputValue不足，则拆分到下一个JoinSplit进行满足
             if (jsInputValue > outAmount) {
                 jsChange = jsInputValue - outAmount;
             } else if (outAmount > jsInputValue) {
@@ -1785,6 +1831,7 @@ void TransactionBuilder::CreateJSDescriptions()
         vjsout[0] = recipient;
 
         // create output for any change
+        // 如果jsInputValue - recipient.value有剩余，额外铸造一个零钱note
         if (jsChange > 0) {
             vjsout[1] = libzcash::JSOutput(changeAddress, jsChange);
 
@@ -1795,6 +1842,7 @@ void TransactionBuilder::CreateJSDescriptions()
         std::array<size_t, ZC_NUM_JS_OUTPUTS> outputMap;
         CreateJSDescription(vpub_old, vpub_new, vjsin, vjsout, inputMap, outputMap);
 
+        // 记录零钱note的index，结束后转到下一个JoinSplit的处理
         if (jsChange > 0) {
             changeOutputIndex = -1;
             for (size_t i = 0; i < outputMap.size(); i++) {
@@ -1808,22 +1856,32 @@ void TransactionBuilder::CreateJSDescriptions()
 }
 ```
 
+这段代码逻辑稍复杂，这里用注释的方式进行了详细的解释。简单来说，
+
+1. 在一笔Sprout交易中，Zcash用一个JoinSplit序列来处理所有的隐匿转账；
+2. 第一个JoinSplit接收公开资产，最后一个JoinSplit铸造公开资产；
+3. 每一个JoinSplit都尝试处理一对input和output，`input[0]`位置可选的处理上一个JoinSplit结余的零钱，而`output[1]`位置可选的铸造JoinSplit未处理完的零钱；
+4. 当`output.value > input.value`时，output也将被拆分到下一个JoinSplit继续处理；
+5. 有零钱继承关系的JoinSplit使用连续的树状态，即产生零钱的JoinSplit终结状态为处理零钱的JoinSplit起始状态；
+6. 没有零钱继承关系的JoinSplit使用间隔的树状态，即JoinSplit的起始状态为`input[0]`铸造时的终结状态。
+
+后面的签名相比之下较为简单，方法`crypto_sign_detached`调用到了外部的libsodium完成签名，而被签名的数据`dataToBeSigned`则是包含了交易完整终结状态上下文`mtx`的哈希。
+
 ## Sprout验证
 
-在zk-SNARK的证明中，Sprout只证明了以下几件事：
+在zk-SNARK的证明中，Sprout证明了以下几件事：
 
-1. Prover持有能够生成指定commitment的note参数和spending key；
-2. Prover消耗的note来自于Sprout Merkel Tree，且value合法；
-3. Prover给出的merkel tree path有效；
-4. Prover铸造了一些新note，且value也合法；
-5. Prover铸造新note的value总和等于他销毁掉的value总和。
+1. Prover持有能够生成指定input note commitment的参数，即spending key；
+2. Prover消耗一些来自于有效Sprout Merkel Subtree的input note，且它们的和合法；
+3. Prover铸造了一些新的output note给某个receiving key，且value也合法；
+4. Prover铸造新note的value总和加上公开的`vpub_new`等于他销毁掉的value总和加上公开的`vpub_old`。
 
 Prover当然还公开了包括`rt`、`h_sig`、`nf`、`mac`、`cm`、`vpub_old`、`vpub_new`在内的public inputs，再用它们构建了遮蔽的、不会被盗用的交易，但是还有一些问题没有解决：
 
 1. 区块中不同交易的anchor root不同时如何检查state；
 2. commitment证明存在被二次计算后盗用的可能。
 
-zk-SNARKs verify的过程发生在[`CheckTransaction()`](https://github.com/zcash/zcash/blob/master/src/main.cpp#L1381)，
+上述问题的答案需要我们去Sprout的验证过程中寻找。交易验证的过程发生在[`CheckTransaction()`](https://github.com/zcash/zcash/blob/master/src/main.cpp#L1381)，对应如下代码，
 
 ```cpp
 bool CheckTransaction(const CTransaction& tx, CValidationState &state,

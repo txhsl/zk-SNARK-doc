@@ -339,7 +339,7 @@ pub fn output_proof(
 }
 ```
 
-#### 电路
+#### 证明电路
 
 这里同样的，我们可以在[zcash/librustzcash/zcash_proofs/src/circuit/sapling.rs](https://github.com/zcash/librustzcash/blob/main/zcash_proofs/src/circuit/sapling.rs#L118)找到Spend电路的定义，对应代码如下，
 
@@ -756,4 +756,4 @@ impl Circuit<bls12_381::Scalar> for Output {
 
 ### bellman计算
 
-Sapling后面调用bellman生成证明时，同样使用了`create_random_proof`，因此过程和之前一样，使用相同的约束系统，不再赘述。
+Sapling后面调用bellman生成证明时，同样使用了`create_random_proof`，因此过程和之前一样，以及使用了相同的`ProvingAssignment`，不再赘述。

@@ -11,7 +11,7 @@ Zcash中的zk-SNARK总是证明两件事：
 
 ### zcash入口
 
-先上JoinSplit的证明入口，在[zcash/zcash/src/zcash/JoinSplit.cpp](https://github.com/zcash/zcash/blob/master/src/zcash/JoinSplit.cpp)，该入口接收来自Zcash其他模块的结构输入，每个JoinSplit都包含2个input和2个output，分别至多有一个可为空，
+先上JoinSplit的证明入口，在[zcash/zcash/src/zcash/JoinSplit.cpp](https://github.com/zcash/zcash/blob/master/src/zcash/JoinSplit.cpp)，该入口接收来自Zcash其他模块的结构输入，每个JoinSplit都包含2个input和2个output，分别有一个或者两个可为空，同时包含一个vpub_old和vpub_new，分别可都为零。需要注意的是`input.value`和`output.value`代表Sprout隐匿资产池的销毁和铸造数量，而`vpub_old`和`vpub_new`代表公开资产池的销毁和铸造数量，别担心，我们会在平衡验证的描述中具体解释。
 
 ```cpp
 template<size_t NumInputs, size_t NumOutputs>
@@ -200,11 +200,11 @@ SproutProof JoinSplit<NumInputs, NumOutputs>::prove(
 
 1. 检测交易的输入和输出总数量都合法；
 2. 检测每个input note，**witness来自的merkle tree root等于输入参数里交易声明的tree root**，witness产生时merkle tree最新的`element`等于note可计算出的`commitment`，发送者spending key衍生出的`a_pk`是note铸造给的`a_pk`，note标称的`value`是合法的；
-3. 总和交易中所有的input note value，总价是合法的；
+3. 总和交易中所有的input value，总价是合法的，`lhs_value = vpub_old + inputs[0].note.value() + inputs[1].note.value()`，`lhs_value`代表了发送者销毁的公开资金和隐匿资金总量；
 4. 给每一个input note计算`nullifier`；
 5. 取随机的`randomSeed`计算`h_sig`，再取`phi`、`r`为每个output计算新note；
 6. 检测每个output note，note标称的`value`是合法的；
-7. 总和所有的output note `value`，总价是合法的；
+7. 总和所有的output value，总价是合法的，`rhs_value = vpub_new + outputs[0].note.value() + outputs[1].note.value()`，`rhs_value`代表了发送者铸造的公开资金和隐匿资金总量；
 8. 给每一个output note计算`commitment`；
 9. 加密每一个output note，之后通过secret sharing传递给接收者；
 10. 用`h_sig`给每个input note添加保护，防止被盗用；
@@ -355,7 +355,7 @@ pub fn create_proof(
 
 这里在执行`let js = JoinSplit {...};`这一行代码时，顺便也携带了JoinSplit对应的电路。
 
-#### 电路
+#### 证明电路
 
 这个电路的定义在[zcash/librustzcash/zcash_proofs/src/circuit/sprout/mod.rs](https://github.com/zcash/librustzcash/blob/main/zcash_proofs/src/circuit/sprout/mod.rs#L57)，对应下面的代码，
 
@@ -518,18 +518,143 @@ impl<Scalar: PrimeField> Circuit<Scalar> for JoinSplit {
 }
 ```
 
-以上电路按照顺序包含了以下statement：
+以上代码按照顺序包含了以下操作：
 
 1. 验证input和output的数量都为2；
-2. 见证`vpub_old`、`vpub_new`、merkle tree root `rt`、`h_sig`和`phi`，方法`witness_u256`在电路定义的[下方](https://github.com/zcash/librustzcash/blob/main/zcash_proofs/src/circuit/sprout/mod.rs#L320)，是byte数组的遍历拷贝；
+2. 见证`vpub_old`、`vpub_new`、merkle tree root `rt`、`h_sig`和`phi`，使用到了新结构[`NoteValue`](https://github.com/zcash/librustzcash/blob/main/zcash_proofs/src/circuit/sprout/mod.rs#L220)和方法[`witness_u256`](https://github.com/zcash/librustzcash/blob/main/zcash_proofs/src/circuit/sprout/mod.rs#L320)；
+
+```rust
+pub struct NoteValue {
+    value: Option<u64>,
+    // Least significant digit first
+    bits: Vec<AllocatedBit>,
+}
+
+impl NoteValue {
+    fn new<Scalar, CS>(mut cs: CS, value: Option<u64>) -> Result<NoteValue, SynthesisError>
+    where
+        Scalar: PrimeField,
+        CS: ConstraintSystem<Scalar>,
+    {
+        let mut values;
+        match value {
+            Some(mut val) => {
+                values = vec![];
+                for _ in 0..64 {
+                    values.push(Some(val & 1 == 1));
+                    val >>= 1;
+                }
+            }
+            None => {
+                values = vec![None; 64];
+            }
+        }
+
+        let mut bits = vec![];
+        for (i, value) in values.into_iter().enumerate() {
+            bits.push(AllocatedBit::alloc(
+                cs.namespace(|| format!("bit {}", i)),
+                value,
+            )?);
+        }
+
+        Ok(NoteValue { value, bits })
+    }
+
+    /// Encodes the bits of the value into little-endian
+    /// byte order.
+    fn bits_le(&self) -> Vec<Boolean> {
+        self.bits
+            .chunks(8)
+            .flat_map(|v| v.iter().rev())
+            .cloned()
+            .map(Boolean::from)
+            .collect()
+    }
+
+    /// Computes this value as a linear combination of
+    /// its bits.
+    fn lc<Scalar: PrimeField>(&self) -> LinearCombination<Scalar> {
+        let mut tmp = LinearCombination::zero();
+
+        let mut coeff = Scalar::one();
+        for b in &self.bits {
+            tmp = tmp + (coeff, b.get_variable());
+            coeff = coeff.double();
+        }
+
+        tmp
+    }
+
+    fn get_value(&self) -> Option<u64> {
+        self.value
+    }
+}
+```
+
+首先是结构`NoteValue`，它包含了一个`value`的原始数值和一个见证后的`bits`数组，用两种格式表示相同的内容。在调用初始化时，上述代码会将传入的`u64`类型逐步减位，转换成由0和1表示的数组。拆解完成后，该输出会被`AllocatedBit`电路见证，然后存储到`bits`数组中。关于`AllocatedBit`，我们会在之后的哈希电路中再次见到它并具体描述。
+
+在`JoinSplit`、`InputNote`和`OutputNote`的计算中，代码均使用`value.lc()`作为输入，而非`value.value`。`lc`方法逆方向将`bits`组建为`LinearCombination<Scalar>`。由于只在`Scalar::one()`上做正数乘法和正数加法，该方法必然返回一个正值。
+
+```rust
+/// Witnesses some bytes in the constraint system,
+/// skipping the first `skip_bits`.
+fn witness_bits<Scalar, CS>(
+    mut cs: CS,
+    value: Option<&[u8]>,
+    num_bits: usize,
+    skip_bits: usize,
+) -> Result<Vec<Boolean>, SynthesisError>
+where
+    Scalar: PrimeField,
+    CS: ConstraintSystem<Scalar>,
+{
+    let bit_values = if let Some(value) = value {
+        let mut tmp = vec![];
+        for b in value
+            .iter()
+            .flat_map(|&m| (0..8).rev().map(move |i| m >> i & 1 == 1))
+            .skip(skip_bits)
+        {
+            tmp.push(Some(b));
+        }
+        tmp
+    } else {
+        vec![None; num_bits]
+    };
+    assert_eq!(bit_values.len(), num_bits);
+
+    let mut bits = vec![];
+
+    for (i, value) in bit_values.into_iter().enumerate() {
+        bits.push(Boolean::from(AllocatedBit::alloc(
+            cs.namespace(|| format!("bit {}", i)),
+            value,
+        )?));
+    }
+
+    Ok(bits)
+}
+
+fn witness_u256<Scalar, CS>(cs: CS, value: Option<&[u8]>) -> Result<Vec<Boolean>, SynthesisError>
+where
+    Scalar: PrimeField,
+    CS: ConstraintSystem<Scalar>,
+{
+    witness_bits(cs, value, 256, 0)
+}
+```
+
+而`witness_u256`方法，则接受`u8`类型作为输入，以类似的过程将`value`转换为长度为256的`bits`数组。在方法中，我们可以看到代码同样调用了`AllocatedBit`进行见证。
+
 3. 遍历JoinSplit的每个input，统计并见证它们的`value`；
 4. 为inputs[0]和inputs[1]授予不同的`nonce`(false和true)；
 5. 组装包含`nonce`的input notes并见证（这里包含一个嵌套，在下面）；
-6. enforce验证统计的input value总和等于`vpub_old`，`lhs * 1 = lhs_total`；
+6. enforce验证统计的input value总和等于`vpub_old`，`lhs * 1 = lhs_total`，需要注意的是，`lhs = vpub_old.lc() + inputs[0].value.lc() + inputs[1].value.lc()`，而`lhs_total = vpub_old + inputs[0].value + inputs[1].value`。若该验证不通过，则存在某个input的`value`非法；
 7. 遍历JoinSplit的每个output，统计并见证它们的`value`；
 8. 为outputs[0]和outputs[1]授予不同的`nonce`(false和true)；
-8. 组装包含`nonce`的output notes并见证（这里包含一个嵌套，在下面）；
-9. enforce验证统计的input value总和output value总和相等，`lhs * 1 = rhs`；
+8. 组装包含`nonce`的output notes并见证（这里包含一个嵌套，在下面），组装时使用`value.bits`，故必为正数；
+9. enforce验证统计的input value总和output value总和相等，`lhs * 1 = rhs`，需要注意的是，`rhs = vpub_new.lc() + outputs[0].value.lc() + outputs[1].value.lc()`，其中每一项都必为正数，且`output.value`必然和上一步生成Note的value相同；
 10. 将`rt`、`h_sig`、`nf`、`mac`、`cm`、`vpub_old`、`vpub_new`打包为public inputs。
 
 在第4步声明中，又嵌套了另一个电路[InputNote](https://github.com/zcash/librustzcash/blob/main/zcash_proofs/src/circuit/sprout/input.rs)计算note的mac和nf，也做了一些进一步的验证，
@@ -641,7 +766,7 @@ impl InputNote {
 }
 ```
 
-在返回mac和nf之前，电路做以下几件事：
+在返回mac和nf之前，上述方法做以下几件事：
 
 1. 见证`a_sk`、`rho`、`r`，计算并见证了`a_pk`、`nf`、`mac`和`cm`，方法`prf_a_pk`、`prf_nf`、`prf_pk`的定义可见[此处](https://github.com/zcash/librustzcash/blob/main/zcash_proofs/src/circuit/sprout/prfs.rs)，最终都调用了以下`prf`方法，组装一个vector后调用bellman提供的[sha256_block_no_padding](https://github.com/zkcrypto/bellman/blob/main/src/gadgets/sha256.rs#L29)，而方法`note_comm`则调用了bellman一个有padding的[sha256](https://github.com/zkcrypto/bellman/blob/main/src/gadgets/sha256.rs#L47)方法；
 
@@ -905,9 +1030,9 @@ impl OutputNote {
 }
 ```
 
-类似的，上面这个电路也做了几件事，计算`rho`，见证`a_pk`和`r`，然后计算一个新的`cm`，调用的方法和`InputNote`调用的一样，不用再赘述了。
+类似的，以上方法也做了这几件事，计算`rho`，见证`a_pk`和`r`，然后计算一个新的`cm`，调用的方法和`InputNote`调用的一样，不用再赘述了。
 
-在三个电路中我们可以看到名为`ConstraintSystem`的约束贯穿始终。在下面的证明生成中我们可以看到它的初始化。
+在三个电路中我们可以看到名为`ConstraintSystem`的参数空间贯穿始终。在下面的证明生成中我们可以看到它的初始化。
 
 ### bellman计算
 
@@ -945,7 +1070,7 @@ where
     E::Fr: PrimeFieldBits,
     C: Circuit<E::Fr>,
 {
-    // 这里的prover使用了ProvingAssignment的约束系统
+    // 这里的prover使用了ProvingAssignment的约束系统，包含了一部分预计算的过程
     let mut prover = ProvingAssignment {
         a_aux_density: DensityTracker::new(),
         b_input_density: DensityTracker::new(),
@@ -1127,7 +1252,7 @@ where
 
 以上方法直接接受电路`C`和参数`P`，完成了最后的证明生成过程。一条完整的Sprout生成JoinSplit证明的调用线到此为止。
 
-#### 约束系统
+#### ProvingAssignment
 
 在方法的开头，我们的prover被初始化为`ProvingAssignment`类型，后者在[代码声明](https://github.com/zkcrypto/bellman/blob/main/src/groth16/prover.rs#L57)中是如下的结构体：
 
@@ -1254,24 +1379,9 @@ impl<S: PrimeField> ConstraintSystem<S> for ProvingAssignment<S> {
 class CTransaction
 {
 private:
-    /// The consensus branch ID that this transaction commits to.
-    /// Serialized from v5 onwards.
-    std::optional<uint32_t> nConsensusBranchId;
-    // Sapling Tx
-    CAmount valueBalanceSapling;
-    // Orchard Tx
-    OrchardBundle orchardBundle;
-
-    /** Memory only. */
-    const WTxId wtxid;
-    void UpdateHash() const;
-
+    // ......
 protected:
-    /** Developer testing only.  Set evilDeveloperFlag to true.
-     * Convert a CMutableTransaction into a CTransaction without invoking UpdateHash()
-     */
-    CTransaction(const CMutableTransaction &tx, bool evilDeveloperFlag);
-
+    // ......
 public:
     typedef std::array<unsigned char, 64> joinsplit_sig_t;
     typedef std::array<unsigned char, 64> binding_sig_t;
@@ -1404,23 +1514,314 @@ public:
 }
 ```
 
-不出意外，和我们在生成证明时候揭露的公共参数基本相同。
+不出意外，和我们在生成证明时候揭露的公共参数基本相同。可惜的是，Sprout协议下构建交易的过程已经被移除，我们只能在历史代码中找到对`ZCJoinSplit`的[使用](https://github.com/zcash/zcash/blob/v3.0.0/src/transaction_builder.cpp#L367)，选取了一部分如下，
+
+```cpp
+//
+// Sprout JoinSplits
+//
+
+unsigned char joinSplitPrivKey[crypto_sign_SECRETKEYBYTES];
+crypto_sign_keypair(mtx.joinSplitPubKey.begin(), joinSplitPrivKey);
+
+// Create Sprout JSDescriptions
+if (!jsInputs.empty() || !jsOutputs.empty()) {
+    try {
+        CreateJSDescriptions();
+    } catch (JSDescException e) {
+        librustzcash_sapling_proving_ctx_free(ctx);
+        return TransactionBuilderResult(e.what());
+    } catch (std::runtime_error e) {
+        librustzcash_sapling_proving_ctx_free(ctx);
+        throw e;
+    }
+}
+
+// ......
+
+// Create Sprout joinSplitSig
+if (crypto_sign_detached(
+    mtx.joinSplitSig.data(), NULL,
+    dataToBeSigned.begin(), 32,
+    joinSplitPrivKey) != 0)
+{
+    return TransactionBuilderResult("Failed to create Sprout joinSplitSig");
+}
+
+// Sanity check Sprout joinSplitSig
+if (crypto_sign_verify_detached(
+    mtx.joinSplitSig.data(),
+    dataToBeSigned.begin(), 32,
+    mtx.joinSplitPubKey.begin()) != 0)
+{
+    return TransactionBuilderResult("Sprout joinSplitSig sanity check failed");
+}
+```
+
+我们先看JoinSplit的序列构建过程，
+
+```cpp
+void TransactionBuilder::CreateJSDescriptions()
+{
+    // Copy jsInputs and jsOutputs to more flexible containers
+    std::deque<libzcash::JSInput> jsInputsDeque;
+    for (auto jsInput : jsInputs) {
+        jsInputsDeque.push_back(jsInput);
+    }
+    std::deque<libzcash::JSOutput> jsOutputsDeque;
+    for (auto jsOutput : jsOutputs) {
+        jsOutputsDeque.push_back(jsOutput);
+    }
+
+    // If we have no Sprout shielded inputs, then we do the simpler more-leaky
+    // process where we just create outputs directly. We save the chaining logic,
+    // at the expense of leaking the sums of pairs of output values in vpub_old.
+    // 当JoinSplit的input数量为0，则vpub_old = outputs[0].value + outputs[1].value,
+    // 意味着发送者从自己的公开资产销毁vpub_old，并将等量的隐匿资产铸造到Sprout资金池
+    // vpub_old是公开的，所以会称泄露了output value的总量信息
+    if (jsInputs.empty()) {
+        // Create joinsplits, where each output represents a zaddr recipient.
+        while (jsOutputsDeque.size() > 0) {
+            // Default array entries are dummy inputs and outputs
+            std::array<libzcash::JSInput, ZC_NUM_JS_INPUTS> vjsin;
+            std::array<libzcash::JSOutput, ZC_NUM_JS_OUTPUTS> vjsout;
+            uint64_t vpub_old = 0;
+
+            for (int n = 0; n < ZC_NUM_JS_OUTPUTS && jsOutputsDeque.size() > 0; n++) {
+                vjsout[n] = jsOutputsDeque.front();
+                jsOutputsDeque.pop_front();
+
+                // Funds are removed from the value pool and enter the private pool
+                vpub_old += vjsout[n].value;
+            }
+
+            std::array<size_t, ZC_NUM_JS_INPUTS> inputMap;
+            std::array<size_t, ZC_NUM_JS_OUTPUTS> outputMap;
+            CreateJSDescription(vpub_old, 0, vjsin, vjsout, inputMap, outputMap);
+        }
+        return;
+    }
+
+    // At this point, we are guaranteed to have at least one input note.
+    // Use address of first input note as the temporary change address.
+    auto changeKey = jsInputsDeque.front().key;
+    auto changeAddress = changeKey.address();
+
+    CAmount jsChange = 0;          // this is updated after each joinsplit
+    int changeOutputIndex = -1;    // this is updated after each joinsplit if jsChange > 0
+    bool vpubOldProcessed = false; // updated when vpub_old for taddr inputs is set in first joinsplit
+    bool vpubNewProcessed = false; // updated when vpub_new for miner fee and taddr outputs is set in last joinsplit
+
+    CAmount valueOut = 0;
+    for (auto jsInput : jsInputs) {
+        valueOut += jsInput.note.value();
+    }
+    for (auto jsOutput : jsOutputs) {
+        valueOut -= jsOutput.value;
+    }
+    CAmount vpubOldTarget = valueOut < 0 ? -valueOut : 0;
+    CAmount vpubNewTarget = valueOut > 0 ? valueOut : 0;
+
+    // Keep track of treestate within this transaction
+    boost::unordered_map<uint256, SproutMerkleTree, CCoinsKeyHasher> intermediates;
+    std::vector<uint256> previousCommitments;
+
+    while (!vpubNewProcessed) {
+        // Default array entries are dummy inputs and outputs
+        std::array<libzcash::JSInput, ZC_NUM_JS_INPUTS> vjsin;
+        std::array<libzcash::JSOutput, ZC_NUM_JS_OUTPUTS> vjsout;
+        uint64_t vpub_old = 0;
+        uint64_t vpub_new = 0;
+
+        // Set vpub_old in the first joinsplit
+        if (!vpubOldProcessed) {
+            vpub_old += vpubOldTarget; // funds flowing from public pool
+            vpubOldProcessed = true;
+        }
+
+        CAmount jsInputValue = 0;
+        uint256 jsAnchor;
+
+        JSDescription prevJoinSplit;
+
+        // Keep track of previous JoinSplit and its commitments
+        if (mtx.vJoinSplit.size() > 0) {
+            prevJoinSplit = mtx.vJoinSplit.back();
+        }
+
+        // If there is no change, the chain has terminated so we can reset the tracked treestate.
+        if (jsChange == 0 && mtx.vJoinSplit.size() > 0) {
+            intermediates.clear();
+            previousCommitments.clear();
+        }
+
+        //
+        // Consume change as the first input of the JoinSplit.
+        //
+        if (jsChange > 0) {
+            // Update tree state with previous joinsplit
+            SproutMerkleTree tree;
+            {
+                // assert that coinsView is not null
+                assert(coinsView);
+                // We do not check cs_coinView because we do not set this in testing
+                // assert(cs_coinsView);
+                LOCK(cs_coinsView);
+                auto it = intermediates.find(prevJoinSplit.anchor);
+                if (it != intermediates.end()) {
+                    tree = it->second;
+                } else if (!coinsView->GetSproutAnchorAt(prevJoinSplit.anchor, tree)) {
+                    throw JSDescException("Could not find previous JoinSplit anchor");
+                }
+            }
+
+            assert(changeOutputIndex != -1);
+            assert(changeOutputIndex < prevJoinSplit.commitments.size());
+            boost::optional<SproutWitness> changeWitness;
+            int n = 0;
+            for (const uint256& commitment : prevJoinSplit.commitments) {
+                tree.append(commitment);
+                previousCommitments.push_back(commitment);
+                if (!changeWitness && changeOutputIndex == n++) {
+                    changeWitness = tree.witness();
+                } else if (changeWitness) {
+                    changeWitness.get().append(commitment);
+                }
+            }
+            assert(changeWitness.has_value());
+            jsAnchor = tree.root();
+            intermediates.insert(std::make_pair(tree.root(), tree)); // chained js are interstitial (found in between block boundaries)
+
+            // Decrypt the change note's ciphertext to retrieve some data we need
+            ZCNoteDecryption decryptor(changeKey.receiving_key());
+            auto hSig = prevJoinSplit.h_sig(*sproutParams, mtx.joinSplitPubKey);
+            try {
+                auto plaintext = libzcash::SproutNotePlaintext::decrypt(
+                    decryptor,
+                    prevJoinSplit.ciphertexts[changeOutputIndex],
+                    prevJoinSplit.ephemeralKey,
+                    hSig,
+                    (unsigned char)changeOutputIndex);
+
+                auto note = plaintext.note(changeAddress);
+                vjsin[0] = libzcash::JSInput(changeWitness.get(), note, changeKey);
+
+                jsInputValue += plaintext.value();
+
+                LogPrint("zrpcunsafe", "spending change (amount=%s)\n", FormatMoney(plaintext.value()));
+
+            } catch (const std::exception& e) {
+                throw JSDescException("Error decrypting output note of previous JoinSplit");
+            }
+        }
+
+        //
+        // Consume spendable non-change notes
+        //
+        for (int n = (jsChange > 0) ? 1 : 0; n < ZC_NUM_JS_INPUTS && jsInputsDeque.size() > 0; n++) {
+            auto jsInput = jsInputsDeque.front();
+            jsInputsDeque.pop_front();
+
+            // Add history of previous commitments to witness
+            if (jsChange > 0) {
+                for (const uint256& commitment : previousCommitments) {
+                    jsInput.witness.append(commitment);
+                }
+                if (jsAnchor != jsInput.witness.root()) {
+                    throw JSDescException("Witness for spendable note does not have same anchor as change input");
+                }
+            }
+
+            // The jsAnchor is null if this JoinSplit is at the start of a new chain
+            if (jsAnchor.IsNull()) {
+                jsAnchor = jsInput.witness.root();
+            }
+
+            jsInputValue += jsInput.note.value();
+            vjsin[n] = jsInput;
+        }
+
+        // Find recipient to transfer funds to
+        libzcash::JSOutput recipient;
+        if (jsOutputsDeque.size() > 0) {
+            recipient = jsOutputsDeque.front();
+            jsOutputsDeque.pop_front();
+        }
+        // `recipient` is now either a valid recipient, or a dummy output with value = 0
+
+        // Reset change
+        jsChange = 0;
+        CAmount outAmount = recipient.value;
+
+        // Set vpub_new in the last joinsplit (when there are no more notes to spend or zaddr outputs to satisfy)
+        if (jsOutputsDeque.empty() && jsInputsDeque.empty()) {
+            assert(!vpubNewProcessed);
+            if (jsInputValue < vpubNewTarget) {
+                throw JSDescException(strprintf("Insufficient funds for vpub_new %s", FormatMoney(vpubNewTarget)));
+            }
+            outAmount += vpubNewTarget;
+            vpub_new += vpubNewTarget; // funds flowing back to public pool
+            vpubNewProcessed = true;
+            jsChange = jsInputValue - outAmount;
+            assert(jsChange >= 0);
+        } else {
+            // This is not the last joinsplit, so compute change and any amount still due to the recipient
+            if (jsInputValue > outAmount) {
+                jsChange = jsInputValue - outAmount;
+            } else if (outAmount > jsInputValue) {
+                // Any amount due is owed to the recipient.  Let the miners fee get paid first.
+                CAmount due = outAmount - jsInputValue;
+                libzcash::JSOutput recipientDue(recipient.addr, due);
+                recipientDue.memo = recipient.memo;
+                jsOutputsDeque.push_front(recipientDue);
+
+                // reduce the amount being sent right now to the value of all inputs
+                recipient.value = jsInputValue;
+            }
+        }
+
+        // create output for recipient
+        assert(ZC_NUM_JS_OUTPUTS == 2); // If this changes, the logic here will need to be adjusted
+        vjsout[0] = recipient;
+
+        // create output for any change
+        if (jsChange > 0) {
+            vjsout[1] = libzcash::JSOutput(changeAddress, jsChange);
+
+            LogPrint("zrpcunsafe", "generating note for change (amount=%s)\n", FormatMoney(jsChange));
+        }
+
+        std::array<size_t, ZC_NUM_JS_INPUTS> inputMap;
+        std::array<size_t, ZC_NUM_JS_OUTPUTS> outputMap;
+        CreateJSDescription(vpub_old, vpub_new, vjsin, vjsout, inputMap, outputMap);
+
+        if (jsChange > 0) {
+            changeOutputIndex = -1;
+            for (size_t i = 0; i < outputMap.size(); i++) {
+                if (outputMap[i] == 1) {
+                    changeOutputIndex = i;
+                }
+            }
+            assert(changeOutputIndex != -1);
+        }
+    }
+}
+```
 
 ## Sprout验证
 
 在zk-SNARK的证明中，Sprout只证明了以下几件事：
 
 1. Prover持有能够生成指定commitment的note参数和spending key；
-2. Prover消耗的note来自于Sprout Merkel Tree；
+2. Prover消耗的note来自于Sprout Merkel Tree，且value合法；
 3. Prover给出的merkel tree path有效；
-4. Prover铸造了一些新note；
+4. Prover铸造了一些新note，且value也合法；
 5. Prover铸造新note的value总和等于他销毁掉的value总和。
 
 Prover当然还公开了包括`rt`、`h_sig`、`nf`、`mac`、`cm`、`vpub_old`、`vpub_new`在内的public inputs，再用它们构建了遮蔽的、不会被盗用的交易，但是还有一些问题没有解决：
 
-1. 铸造的output note value没有证明为非负；
-2. 区块中不同交易的anchor root不同时如何检查state；
-3. commitment证明存在被二次计算后盗用的可能。
+1. 区块中不同交易的anchor root不同时如何检查state；
+2. commitment证明存在被二次计算后盗用的可能。
 
 zk-SNARKs verify的过程发生在[`CheckTransaction()`](https://github.com/zcash/zcash/blob/master/src/main.cpp#L1381)，
 

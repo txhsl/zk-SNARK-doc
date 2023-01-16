@@ -1374,6 +1374,8 @@ impl<S: PrimeField> ConstraintSystem<S> for ProvingAssignment<S> {
 
 在上面的证明部分，我们已经知道了JoinSplit的结构组成，以及Proof证明的具体内容，接下来这部分内容将具体描述Zcash节点如何从RPC指令的参数中构建Sprout交易以及如何处理Sprout Merkel Tree。
 
+### 交易结构
+
 直接上Zcash的交易结构定义，在[zcash/zcash/src/primitives/transaction.h](https://github.com/zcash/zcash/blob/master/src/primitives/transaction.h#L703)，
 
 ```cpp
@@ -1517,6 +1519,8 @@ public:
     // ......
 }
 ```
+
+### 构建过程
 
 不出意外，和我们在生成证明时候揭露的公共参数基本相同。可惜的是，Sprout协议下构建交易的过程已经被移除，我们只能在历史代码中找到对`ZCJoinSplit`的[使用](https://github.com/zcash/zcash/blob/v3.0.0/src/transaction_builder.cpp#L367)，选取了一部分如下，
 
@@ -1876,12 +1880,152 @@ void TransactionBuilder::CreateJSDescriptions()
 3. Prover铸造了一些新的output note给某个receiving key，且value也合法；
 4. Prover铸造新note的value总和加上公开的`vpub_new`等于他销毁掉的value总和加上公开的`vpub_old`。
 
-Prover当然还公开了包括`rt`、`h_sig`、`nf`、`mac`、`cm`、`vpub_old`、`vpub_new`在内的public inputs，再用它们构建了遮蔽的、不会被盗用的交易，但是还有一些问题没有解决：
+Prover当然还公开了包括`rt`、`h_sig`、`nf`、`mac`、`cm`、`vpub_old`、`vpub_new`在内的public inputs，再用它们构建了遮蔽的、不会被盗用的交易，但是交易的验证，尤其是间隙树状态的异步验证还没有解决，需要我们继续去寻找。
 
-1. 区块中不同交易的anchor root不同时如何检查state；
-2. commitment证明存在被二次计算后盗用的可能。
+Zcash中一个完整的矿工验证逻辑包含四步：验证区块头、验证区块、验证区块上下文和连接区块。其中区块头的验证和Bitcoin基本相同，因此这一节中我们将描述其他的后三步，
 
-上述问题的答案需要我们去Sprout的验证过程中寻找。交易验证的过程发生在[`CheckTransaction()`](https://github.com/zcash/zcash/blob/master/src/main.cpp#L1381)，对应如下代码，
+```cpp
+// NOTE: CheckBlockHeader is called by CheckBlock
+if (!ContextualCheckBlockHeader(block, state, chainparams, pindexPrev))
+    return false;
+// The following may be duplicative of the `CheckBlock` call within `ConnectBlock`
+if (!CheckBlock(block, state, chainparams, verifier, false, fCheckMerkleRoot, true))
+    return false;
+if (!ContextualCheckBlock(block, state, chainparams, pindexPrev, true))
+    return false;
+if (!ConnectBlock(block, state, &indexDummy, viewNew, chainparams, true, blockChecks))
+    return false;
+assert(state.IsValid());
+
+return true;
+```
+
+### 上下文无关验证
+
+根据一些众所周知的常识，作为Verifier的Zcash节点首先以区块的形式接收到交易，我们可以在[zcash/zcash/src/main.cpp](https://github.com/zcash/zcash/blob/master/src/main.cpp#L4753)找到这个入口，
+
+```cpp
+bool CheckBlock(const CBlock& block,
+                CValidationState& state,
+                const CChainParams& chainparams,
+                ProofVerifier& verifier,
+                bool fCheckPOW,
+                bool fCheckMerkleRoot,
+                bool fCheckTransactions)
+{
+    // These are checks that are independent of context.
+
+    if (block.fChecked)
+        return true;
+
+    // Check that the header is valid (particularly PoW).  This is mostly
+    // redundant with the call in AcceptBlockHeader.
+    if (!CheckBlockHeader(block, state, chainparams, fCheckPOW))
+        return false;
+
+    // Check the merkle root.
+    if (fCheckMerkleRoot) {
+        bool mutated;
+        uint256 hashMerkleRoot2 = BlockMerkleRoot(block, &mutated);
+        if (block.hashMerkleRoot != hashMerkleRoot2)
+            return state.DoS(100, error("CheckBlock(): hashMerkleRoot mismatch"),
+                             REJECT_INVALID, "bad-txnmrklroot", true);
+
+        // Check for merkle tree malleability (CVE-2012-2459): repeating sequences
+        // of transactions in a block without affecting the merkle root of a block,
+        // while still invalidating it.
+        if (mutated)
+            return state.DoS(100, error("CheckBlock(): duplicate transaction"),
+                             REJECT_INVALID, "bad-txns-duplicate", true);
+    }
+
+    // All potential-corruption validation must be done before we do any
+    // transaction validation, as otherwise we may mark the header as invalid
+    // because we receive the wrong transactions for it.
+
+    // Size limits
+    if (block.vtx.empty() || block.vtx.size() > MAX_BLOCK_SIZE || ::GetSerializeSize(block, SER_NETWORK, PROTOCOL_VERSION) > MAX_BLOCK_SIZE)
+        return state.DoS(100, error("CheckBlock(): size limits failed"),
+                         REJECT_INVALID, "bad-blk-length");
+
+    // First transaction must be coinbase, the rest must not be
+    if (block.vtx.empty() || !block.vtx[0].IsCoinBase())
+        return state.DoS(100, error("CheckBlock(): first tx is not coinbase"),
+                         REJECT_INVALID, "bad-cb-missing");
+    for (unsigned int i = 1; i < block.vtx.size(); i++)
+        if (block.vtx[i].IsCoinBase())
+            return state.DoS(100, error("CheckBlock(): more than one coinbase"),
+                             REJECT_INVALID, "bad-cb-multiple");
+
+    // skip all transaction checks if this flag is not set
+    if (!fCheckTransactions) return true;
+
+    // Check transactions
+    for (const CTransaction& tx : block.vtx)
+        if (!CheckTransaction(tx, state, verifier))
+            return error("CheckBlock(): CheckTransaction of %s failed with %s",
+                tx.GetHash().ToString(),
+                FormatStateMessage(state));
+
+    unsigned int nSigOps = 0;
+    for (const CTransaction& tx : block.vtx)
+    {
+        nSigOps += GetLegacySigOpCount(tx);
+    }
+    if (nSigOps > MAX_BLOCK_SIGOPS)
+        return state.DoS(100, error("CheckBlock(): out-of-bounds SigOpCount"),
+                         REJECT_INVALID, "bad-blk-sigops", true);
+
+    if (fCheckPOW && fCheckMerkleRoot)
+        block.fChecked = true;
+
+    return true;
+}
+```
+
+以上方法完成了区块的一部分检查，这部分检查如同注释所说，是上下文无关的形式上校验，包括了：
+
+1. 区块头的PoW验证；
+2. 区块的Merkel Root验证；
+3. 区块内交易的去重；
+4. 区块大小的验证；
+5. 区块内交易的验证；
+6. 区块使用SigOp数的验证。
+
+我们或许会关注交易如何在这里去重，但是下面的代码告诉我们这里只发生了区块内的去重，同样是上下文无关的，
+
+```cpp
+uint256 ComputeMerkleRoot(std::vector<uint256> hashes, bool* mutated) {
+    bool mutation = false;
+    while (hashes.size() > 1) {
+        if (mutated) {
+            for (size_t pos = 0; pos + 1 < hashes.size(); pos += 2) {
+                if (hashes[pos] == hashes[pos + 1]) mutation = true;
+            }
+        }
+        if (hashes.size() & 1) {
+            hashes.push_back(hashes.back());
+        }
+        SHA256D64(hashes[0].begin(), hashes[0].begin(), hashes.size() / 2);
+        hashes.resize(hashes.size() / 2);
+    }
+    if (mutated) *mutated = mutation;
+    if (hashes.size() == 0) return uint256();
+    return hashes[0];
+}
+
+uint256 BlockMerkleRoot(const CBlock& block, bool* mutated)
+{
+    std::vector<uint256> leaves;
+    leaves.resize(block.vtx.size());
+    for (size_t s = 0; s < block.vtx.size(); s++) {
+        leaves[s] = block.vtx[s].GetHash();
+    }
+    return ComputeMerkleRoot(std::move(leaves), mutated);
+}
+```
+
+Zcash交易验证的过程发生在[`CheckTransaction()`](https://github.com/zcash/zcash/blob/master/src/main.cpp#L1381)，对应如下代码，
 
 ```cpp
 bool CheckTransaction(const CTransaction& tx, CValidationState &state,
@@ -1913,7 +2057,7 @@ bool CheckTransaction(const CTransaction& tx, CValidationState &state,
 }
 ```
 
-其中的`CheckTransactionWithoutProofVerification()`也定义在在[zcash/zcash/src/main.cpp](https://github.com/zcash/zcash/blob/master/src/main.cpp#L1418)，
+其中的`CheckTransactionWithoutProofVerification()`也定义在在[zcash/zcash/src/main.cpp](https://github.com/zcash/zcash/blob/master/src/main.cpp#L1418)，下面截取其中和Sprout有关的一部分，
 
 ```cpp
 /**
@@ -1927,46 +2071,7 @@ bool CheckTransaction(const CTransaction& tx, CValidationState &state,
  */
 bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidationState &state)
 {
-    /**
-     * Previously:
-     * 1. The consensus rule below was:
-     *        if (tx.nVersion < SPROUT_MIN_TX_VERSION) { ... }
-     *    which checked if tx.nVersion fell within the range:
-     *        INT32_MIN <= tx.nVersion < SPROUT_MIN_TX_VERSION
-     * 2. The parser allowed tx.nVersion to be negative
-     *
-     * Now:
-     * 1. The consensus rule checks to see if tx.Version falls within the range:
-     *        0 <= tx.nVersion < SPROUT_MIN_TX_VERSION
-     * 2. The previous consensus rule checked for negative values within the range:
-     *        INT32_MIN <= tx.nVersion < 0
-     *    This is unnecessary for Overwinter transactions since the parser now
-     *    interprets the sign bit as fOverwintered, so tx.nVersion is always >=0,
-     *    and when Overwinter is not active ContextualCheckTransaction rejects
-     *    transactions with fOverwintered set.  When fOverwintered is set,
-     *    this function and ContextualCheckTransaction will together check to
-     *    ensure tx.nVersion avoids the following ranges:
-     *        0 <= tx.nVersion < OVERWINTER_MIN_TX_VERSION
-     *        OVERWINTER_MAX_TX_VERSION < tx.nVersion <= INT32_MAX
-     */
-    if (!tx.fOverwintered && tx.nVersion < SPROUT_MIN_TX_VERSION) {
-        return state.DoS(100, error("CheckTransaction(): version too low"),
-                         REJECT_INVALID, "bad-txns-version-too-low");
-    }
-    else if (tx.fOverwintered) {
-        if (tx.nVersion < OVERWINTER_MIN_TX_VERSION) {
-            return state.DoS(100, error("CheckTransaction(): overwinter version too low"),
-                REJECT_INVALID, "bad-tx-overwinter-version-too-low");
-        }
-        if (tx.nVersionGroupId != OVERWINTER_VERSION_GROUP_ID &&
-                tx.nVersionGroupId != SAPLING_VERSION_GROUP_ID &&
-                tx.nVersionGroupId != ZIP225_VERSION_GROUP_ID &&
-                tx.nVersionGroupId != ZFUTURE_VERSION_GROUP_ID) {
-            return state.DoS(100, error("CheckTransaction(): unknown tx version group id"),
-                    REJECT_INVALID, "bad-tx-version-group-id");
-        }
-    }
-    auto orchard_bundle = tx.GetOrchardBundle();
+    // ......
 
     // Transactions must contain some potential source of funds. This rejects
     // obviously-invalid transaction constructions early, but cannot prevent
@@ -2017,76 +2122,7 @@ bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidatio
             return state.DoS(100, false, REJECT_INVALID, "bad-txns-txouttotal-toolarge");
     }
 
-    // Check for non-zero valueBalanceSapling when there are no Sapling inputs or outputs
-    if (tx.vShieldedSpend.empty() && tx.vShieldedOutput.empty() && tx.GetValueBalanceSapling() != 0) {
-        return state.DoS(100, error("CheckTransaction(): tx.valueBalanceSapling has no sources or sinks"),
-                            REJECT_INVALID, "bad-txns-valuebalance-nonzero");
-    }
-
-    // Check for overflow valueBalanceSapling
-    if (tx.GetValueBalanceSapling() > MAX_MONEY || tx.GetValueBalanceSapling() < -MAX_MONEY) {
-        return state.DoS(100, error("CheckTransaction(): abs(tx.valueBalanceSapling) too large"),
-                            REJECT_INVALID, "bad-txns-valuebalance-toolarge");
-    }
-
-    if (tx.GetValueBalanceSapling() <= 0) {
-        // NB: negative valueBalanceSapling "takes" money from the transparent value pool just as outputs do
-        nValueOut += -tx.GetValueBalanceSapling();
-
-        if (!MoneyRange(nValueOut)) {
-            return state.DoS(100, error("CheckTransaction(): txout total out of range"),
-                                REJECT_INVALID, "bad-txns-txouttotal-toolarge");
-        }
-    }
-
-    // nSpendsSapling, nOutputsSapling, and nActionsOrchard MUST all be less than 2^16
-    size_t max_elements = (1 << 16) - 1;
-    if (tx.vShieldedSpend.size() > max_elements) {
-        return state.DoS(
-            100,
-            error("CheckTransaction(): 2^16 or more Sapling spends"),
-            REJECT_INVALID, "bad-tx-too-many-sapling-spends");
-    }
-    if (tx.vShieldedOutput.size() > max_elements) {
-        return state.DoS(
-            100,
-            error("CheckTransaction(): 2^16 or more Sapling outputs"),
-            REJECT_INVALID, "bad-tx-too-many-sapling-outputs");
-    }
-    if (orchard_bundle.GetNumActions() > max_elements) {
-        return state.DoS(
-            100,
-            error("CheckTransaction(): 2^16 or more Orchard actions"),
-            REJECT_INVALID, "bad-tx-too-many-orchard-actions");
-    }
-
-    // Check that if neither Orchard spends nor outputs are enabled, the transaction contains
-    // no Orchard actions. This subsumes the check that valueBalanceOrchard must equal zero
-    // in the case that both spends and outputs are disabled.
-    if (orchard_bundle.GetNumActions() > 0 && !orchard_bundle.OutputsEnabled() && !orchard_bundle.SpendsEnabled()) {
-        return state.DoS(
-            100,
-            error("CheckTransaction(): Orchard actions are present, but flags do not permit Orchard spends or outputs"),
-            REJECT_INVALID, "bad-tx-orchard-flags-disable-actions");
-    }
-
-    auto valueBalanceOrchard = orchard_bundle.GetValueBalance();
-
-    // Check for overflow valueBalanceOrchard
-    if (valueBalanceOrchard > MAX_MONEY || valueBalanceOrchard < -MAX_MONEY) {
-        return state.DoS(100, error("CheckTransaction(): abs(tx.valueBalanceOrchard) too large"),
-                         REJECT_INVALID, "bad-txns-valuebalance-toolarge");
-    }
-
-    if (valueBalanceOrchard <= 0) {
-        // NB: negative valueBalanceOrchard "takes" money from the transparent value pool just as outputs do
-        nValueOut += -valueBalanceOrchard;
-
-        if (!MoneyRange(nValueOut)) {
-            return state.DoS(100, error("CheckTransaction(): txout total out of range"),
-                             REJECT_INVALID, "bad-txns-txouttotal-toolarge");
-        }
-    }
+    // ......
 
     // Ensure that joinsplit values are well-formed
     for (const JSDescription& joinsplit : tx.vJoinSplit)
@@ -2139,27 +2175,7 @@ bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidatio
             }
         }
 
-        // Also check for Sapling
-        if (tx.GetValueBalanceSapling() >= 0) {
-            // NB: positive valueBalanceSapling "adds" money to the transparent value pool, just as inputs do
-            nValueIn += tx.GetValueBalanceSapling();
-
-            if (!MoneyRange(nValueIn)) {
-                return state.DoS(100, error("CheckTransaction(): txin total out of range"),
-                                 REJECT_INVALID, "bad-txns-txintotal-toolarge");
-            }
-        }
-
-        // Also check for Orchard
-        if (valueBalanceOrchard >= 0) {
-            // NB: positive valueBalanceOrchard "adds" money to the transparent value pool, just as inputs do
-            nValueIn += valueBalanceOrchard;
-
-            if (!MoneyRange(nValueIn)) {
-                return state.DoS(100, error("CheckTransaction(): txin total out of range"),
-                                    REJECT_INVALID, "bad-txns-txintotal-toolarge");
-            }
-        }
+        // ......
     }
 
     // Check for duplicate inputs
@@ -2187,31 +2203,7 @@ bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidatio
         }
     }
 
-    // Check for duplicate sapling nullifiers in this transaction
-    {
-        set<uint256> vSaplingNullifiers;
-        for (const SpendDescription& spend_desc : tx.vShieldedSpend)
-        {
-            if (vSaplingNullifiers.count(spend_desc.nullifier))
-                return state.DoS(100, error("CheckTransaction(): duplicate nullifiers"),
-                            REJECT_INVALID, "bad-spend-description-nullifiers-duplicate");
-
-            vSaplingNullifiers.insert(spend_desc.nullifier);
-        }
-    }
-
-    // Check for duplicate orchard nullifiers in this transaction
-    {
-        std::set<uint256> vOrchardNullifiers;
-        for (const uint256& nf : tx.GetOrchardBundle().GetNullifiers())
-        {
-            if (vOrchardNullifiers.count(nf))
-                return state.DoS(100, error("CheckTransaction(): duplicate nullifiers"),
-                            REJECT_INVALID, "bad-orchard-nullifiers-duplicate");
-
-            vOrchardNullifiers.insert(nf);
-        }
-    }
+    // ......
 
     if (tx.IsCoinBase())
     {
@@ -2220,17 +2212,7 @@ bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidatio
             return state.DoS(100, error("CheckTransaction(): coinbase has joinsplits"),
                              REJECT_INVALID, "bad-cb-has-joinsplits");
 
-        // A coinbase transaction cannot have spend descriptions
-        if (tx.vShieldedSpend.size() > 0)
-            return state.DoS(100, error("CheckTransaction(): coinbase has spend descriptions"),
-                             REJECT_INVALID, "bad-cb-has-spend-description");
-        // See ContextualCheckTransaction for consensus rules on coinbase output descriptions.
-        if (orchard_bundle.SpendsEnabled())
-            return state.DoS(100, error("CheckTransaction(): coinbase has enableSpendsOrchard set"),
-                             REJECT_INVALID, "bad-cb-has-orchard-spend");
-
-        if (tx.vin[0].scriptSig.size() < 2 || tx.vin[0].scriptSig.size() > 100)
-            return state.DoS(100, false, REJECT_INVALID, "bad-cb-length");
+        // ......
     }
     else
     {
@@ -2243,7 +2225,9 @@ bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidatio
 }
 ```
 
-可以看到的是，`CheckTransactionWithoutProofVerification()`只对交易的内部做了简单的去重，这不能解决我们的问题，接下来再看`VerifySprout()`，它接收我们交易中携带的JSDescription作为输入，然后又跳转向了librustzcash，
+可以看到的是，`CheckTransactionWithoutProofVerification()`对交易的内部做了进一步去重，又对一些公开的数值进行了有效性验证。
+
+接下来再看`VerifySprout()`，它接收我们交易中携带的JSDescription作为输入，然后又跳转向了librustzcash，
 
 ```cpp
 bool ProofVerifier::VerifySprout(
@@ -2258,3 +2242,812 @@ bool ProofVerifier::VerifySprout(
     return std::visit(pv, jsdesc.proof);
 }
 ```
+
+毫无疑问，上述方法也只是对Groth16的证明进行了算法上的验证。
+
+### 上下文验证
+
+上下文有关的区块验证同样发生在[zcash/zcash/src/main.cpp](https://github.com/zcash/zcash/blob/master/src/main.cpp#L4896)，对应下面的代码，
+
+```cpp
+bool ContextualCheckBlock(
+    const CBlock& block, CValidationState& state,
+    const CChainParams& chainparams, CBlockIndex * const pindexPrev,
+    bool fCheckTransactions)
+{
+    const int nHeight = pindexPrev == NULL ? 0 : pindexPrev->nHeight + 1;
+    const Consensus::Params& consensusParams = chainparams.GetConsensus();
+
+    if (fCheckTransactions) {
+        // Check that all transactions are finalized
+        for (const CTransaction& tx : block.vtx) {
+
+            // Check transaction contextually against consensus rules at block height
+            if (!ContextualCheckTransaction(tx, state, chainparams, nHeight, true)) {
+                return false; // Failure reason has been set in validation state object
+            }
+
+            int nLockTimeFlags = 0;
+            int64_t nLockTimeCutoff = (nLockTimeFlags & LOCKTIME_MEDIAN_TIME_PAST)
+                                    ? pindexPrev->GetMedianTimePast()
+                                    : block.GetBlockTime();
+            if (!IsFinalTx(tx, nHeight, nLockTimeCutoff)) {
+                return state.DoS(10, error("%s: contains a non-final transaction", __func__),
+                                 REJECT_INVALID, "bad-txns-nonfinal");
+            }
+        }
+    }
+
+    // Enforce BIP 34 rule that the coinbase starts with serialized block height.
+    // In Zcash this has been enforced since launch, except that the genesis
+    // block didn't include the height in the coinbase (see Zcash protocol spec
+    // section '6.8 Bitcoin Improvement Proposals').
+    if (nHeight > 0)
+    {
+        CScript expect = CScript() << nHeight;
+        if (block.vtx[0].vin[0].scriptSig.size() < expect.size() ||
+            !std::equal(expect.begin(), expect.end(), block.vtx[0].vin[0].scriptSig.begin())) {
+            return state.DoS(100, error("%s: block height mismatch in coinbase", __func__),
+                             REJECT_INVALID, "bad-cb-height");
+        }
+    }
+
+    // ZIP 203: From NU5 onwards, nExpiryHeight is set to the block height in coinbase
+    // transactions.
+    if (consensusParams.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_NU5)) {
+        if (block.vtx[0].nExpiryHeight != nHeight) {
+            return state.DoS(100, error("%s: block height mismatch in nExpiryHeight", __func__),
+                             REJECT_INVALID, "bad-cb-height");
+        }
+    }
+
+    if (consensusParams.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_CANOPY)) {
+    // Funding streams are checked inside ContextualCheckTransaction.
+    // This empty conditional branch exists to enforce this ZIP 207 consensus rule:
+    //
+    //     Once the Canopy network upgrade activates, the existing consensus rule for
+    //     payment of the Founders' Reward is no longer active.
+    } else if ((nHeight > 0) && (nHeight <= consensusParams.GetLastFoundersRewardBlockHeight(nHeight))) {
+        // Coinbase transaction must include an output sending 20% of
+        // the block subsidy to a Founders' Reward script, until the last Founders'
+        // Reward block is reached, with exception of the genesis block.
+        // The last Founders' Reward block is defined as the block just before the
+        // first subsidy halving block, which occurs at halving_interval + slow_start_shift.
+        bool found = false;
+
+        for (const CTxOut& output : block.vtx[0].vout) {
+            if (output.scriptPubKey == chainparams.GetFoundersRewardScriptAtHeight(nHeight)) {
+                if (output.nValue == (GetBlockSubsidy(nHeight, consensusParams) / 5)) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        if (!found) {
+            return state.DoS(100, error("%s: founders reward missing", __func__),
+                             REJECT_INVALID, "cb-no-founders-reward");
+        }
+    }
+
+    return true;
+}
+```
+
+上述方法，以及该方法中调用的`ContextualCheckTransaction()`，都是对区块或者交易是否符合网络当前协议版本进行检查，主要以区块链参数`chainparams`和当前高度`nHeight`为输入，返回验证结果`state`。这里对这块验证简单概括，我们看一下`ContextualCheckTransaction()`方法的开头部分即可，
+
+```cpp
+/**
+ * Check a transaction contextually against a set of consensus rules valid at a given block height.
+ *
+ * Notes:
+ * 1. AcceptToMemoryPool calls CheckTransaction and this function.
+ * 2. ProcessNewBlock calls AcceptBlock, which calls CheckBlock (which calls CheckTransaction)
+ *    and ContextualCheckBlock (which calls this function).
+ * 3. For consensus rules that relax restrictions (where a transaction that is invalid at
+ *    nHeight can become valid at a later height), we make the bans conditional on not
+ *    being in Initial Block Download mode.
+ * 4. The isInitBlockDownload argument is a function parameter to assist with testing.
+ */
+bool ContextualCheckTransaction(
+        const CTransaction& tx,
+        CValidationState &state,
+        const CChainParams& chainparams,
+        const int nHeight,
+        const bool isMined,
+        bool (*isInitBlockDownload)(const Consensus::Params&))
+{
+    const int DOS_LEVEL_BLOCK = 100;
+    // DoS level set to 10 to be more forgiving.
+    const int DOS_LEVEL_MEMPOOL = 10;
+
+    // For constricting rules, we don't need to account for IBD mode.
+    auto dosLevelConstricting = isMined ? DOS_LEVEL_BLOCK : DOS_LEVEL_MEMPOOL;
+    // For rules that are relaxing (or might become relaxing when a future
+    // network upgrade is implemented), we need to account for IBD mode.
+    auto dosLevelPotentiallyRelaxing = isMined ? DOS_LEVEL_BLOCK : (
+        isInitBlockDownload(chainparams.GetConsensus()) ? 0 : DOS_LEVEL_MEMPOOL);
+
+    auto consensus = chainparams.GetConsensus();
+    auto consensusBranchId = CurrentEpochBranchId(nHeight, consensus);
+
+    bool overwinterActive = consensus.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_OVERWINTER);
+    bool saplingActive = consensus.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_SAPLING);
+    bool beforeOverwinter = !overwinterActive;
+    bool heartwoodActive = consensus.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_HEARTWOOD);
+    bool canopyActive = consensus.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_CANOPY);
+    bool nu5Active = consensus.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_NU5);
+    bool futureActive = consensus.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_ZFUTURE);
+
+    assert(!saplingActive || overwinterActive); // Sapling cannot be active unless Overwinter is
+    assert(!heartwoodActive || saplingActive);  // Heartwood cannot be active unless Sapling is
+    assert(!canopyActive || heartwoodActive);   // Canopy cannot be active unless Heartwood is
+    assert(!nu5Active || canopyActive);         // NU5 cannot be active unless Canopy is
+    assert(!futureActive || nu5Active);         // ZFUTURE must include consensus rules for all supported network upgrades.
+
+    // ......
+}
+```
+
+该方法主要是随着Zcash协议的逐步升级而进行的分叉，对一些过低版本，或者存在兼容冲突的违规交易进行剔除。
+
+### 区块连接
+
+在满足区块头验证、上下文无关验证和上下文验证之后，我们距离认为Zcash上的某个区块或者某笔交易是合法的还差最后一步。因为并非所有的Zcash交易都是隐私遮蔽的，隐私证明数据的验证被放到了最后，也就是方法`ConnectBlock()`，这部分代码很长，但我们还是尽可能全地阅读一遍，
+
+```cpp
+bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pindex,
+                  CCoinsViewCache& view, const CChainParams& chainparams,
+                  bool fJustCheck, CheckAs blockChecks)
+{
+    // ......
+
+    // Special case for the genesis block, skipping connection of its transactions
+    // (its coinbase is unspendable)
+    // 创世块的特殊情况
+    if (block.GetHash() == chainparams.GetConsensus().hashGenesisBlock) {
+        if (!fJustCheck) {
+            view.SetBestBlock(pindex->GetBlockHash());
+            // Before the genesis block, there was an empty tree
+            SproutMerkleTree tree;
+            pindex->hashSproutAnchor = tree.root();
+            // The genesis block contained no JoinSplits
+            pindex->hashFinalSproutRoot = pindex->hashSproutAnchor;
+        }
+        return true;
+    }
+
+    // Reject a block that results in a negative shielded value pool balance.
+    // ZIP-209检查，防止某个隐匿资金池的余额变为负值
+    // https://github.com/zcash/zips/blob/main/zip-0209.rst
+    if (chainparams.ZIP209Enabled()) {
+        // Sprout
+        //
+        // We can expect nChainSproutValue to be valid after the hardcoded
+        // height, and this will be enforced on all descendant blocks. If
+        // the node was reindexed then this will be enforced for all blocks.
+        if (pindex->nChainSproutValue) {
+            if (*pindex->nChainSproutValue < 0) {
+                return state.DoS(100, error("ConnectBlock(): turnstile violation in Sprout shielded value pool"),
+                             REJECT_INVALID, "turnstile-violation-sprout-shielded-pool");
+            }
+        }
+
+        // ......
+    }
+
+    // Do not allow blocks that contain transactions which 'overwrite' older transactions,
+    // unless those are already completely spent.
+    for (const CTransaction& tx : block.vtx) {
+        const CCoins* coins = view.AccessCoins(tx.GetHash());
+        if (coins && !coins->IsPruned())
+            return state.DoS(100, error("ConnectBlock(): tried to overwrite transaction"),
+                             REJECT_INVALID, "bad-txns-BIP30");
+    }
+
+    unsigned int flags = SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY;
+
+    // DERSIG (BIP66) is also always enforced, but does not have a flag.
+    // 局部状态初始化
+    CBlockUndo blockundo;
+
+    CCheckQueueControl<CScriptCheck> control(fExpensiveChecks && nScriptCheckThreads ? &scriptcheckqueue : NULL);
+
+    int64_t nTimeStart = GetTimeMicros();
+    CAmount nFees = 0;
+    int nInputs = 0;
+    unsigned int nSigOps = 0;
+    CDiskTxPos pos(pindex->GetBlockPos(), GetSizeOfCompactSize(block.vtx.size()));
+    std::vector<std::pair<uint256, CDiskTxPos> > vPos;
+    vPos.reserve(block.vtx.size());
+    blockundo.vtxundo.reserve(block.vtx.size() - 1);
+    std::vector<CAddressIndexDbEntry> addressIndex;
+    std::vector<CAddressUnspentDbEntry> addressUnspentIndex;
+    std::vector<CSpentIndexDbEntry> spentIndex;
+
+    // Construct the incremental merkle tree at the current
+    // block position,
+    // 找到三个协议各自incremental merkle tree目前合适添加新节点的位置，再验证一次结果
+    auto old_sprout_tree_root = view.GetBestAnchor(SPROUT);
+    // saving the top anchor in the block index as we go.
+    if (!fJustCheck) {
+        pindex->hashSproutAnchor = old_sprout_tree_root;
+    }
+    SproutMerkleTree sprout_tree;
+    // This should never fail: we should always be able to get the root
+    // that is on the tip of our chain
+    assert(view.GetSproutAnchorAt(old_sprout_tree_root, sprout_tree));
+    {
+        // Consistency check: the root of the tree we're given should
+        // match what we asked for.
+        assert(sprout_tree.root() == old_sprout_tree_root);
+    }
+
+    SaplingMerkleTree sapling_tree;
+    assert(view.GetSaplingAnchorAt(view.GetBestAnchor(SAPLING), sapling_tree));
+
+    OrchardMerkleFrontier orchard_tree;
+    if (pindex->pprev && chainparams.GetConsensus().NetworkUpgradeActive(pindex->pprev->nHeight, Consensus::UPGRADE_NU5)) {
+        // Verify that the view's current state corresponds to the previous block.
+        assert(pindex->pprev->hashFinalOrchardRoot == view.GetBestAnchor(ORCHARD));
+        // We only call ConnectBlock() on top of the active chain's tip.
+        assert(!pindex->pprev->hashFinalOrchardRoot.IsNull());
+
+        assert(view.GetOrchardAnchorAt(pindex->pprev->hashFinalOrchardRoot, orchard_tree));
+    } else {
+        if (pindex->pprev) {
+            assert(pindex->pprev->hashFinalOrchardRoot.IsNull());
+        }
+        assert(view.GetOrchardAnchorAt(OrchardMerkleFrontier::empty_root(), orchard_tree));
+    }
+
+    // Grab the consensus branch ID for this block and its parent
+    // 以下两个参数主要帮助Zcash通过共识分叉点，不必重视
+    auto consensusBranchId = CurrentEpochBranchId(pindex->nHeight, chainparams.GetConsensus());
+    auto prevConsensusBranchId = CurrentEpochBranchId(pindex->nHeight - 1, chainparams.GetConsensus());
+
+    size_t total_sapling_tx = 0;
+    size_t total_orchard_tx = 0;
+
+    std::vector<PrecomputedTransactionData> txdata;
+    txdata.reserve(block.vtx.size()); // Required so that pointers to individual PrecomputedTransactionData don't get invalidated
+    // 取出交易数据，尝试验证隐私部分合法性
+    for (unsigned int i = 0; i < block.vtx.size(); i++)
+    {
+        const CTransaction &tx = block.vtx[i];
+        const uint256 hash = tx.GetHash();
+
+        nInputs += tx.vin.size();
+        nSigOps += GetLegacySigOpCount(tx);
+        if (nSigOps > MAX_BLOCK_SIGOPS)
+            return state.DoS(100, error("ConnectBlock(): too many sigops"),
+                             REJECT_INVALID, "bad-blk-sigops");
+
+        // Coinbase transactions are the only case where this vector will not be the same
+        // length as `tx.vin` (since coinbase transactions have a single synthetic input).
+        // Only shielded coinbase transactions will need to produce sighashes for coinbase
+        // transactions; this is handled in ZIP 244 by having the coinbase sighash be the
+        // txid.
+        std::vector<CTxOut> allPrevOutputs;
+
+        // Are the shielded spends' requirements met?
+        // 检测每个隐匿input的有效性，后面会提到
+        if (!Consensus::CheckTxShieldedInputs(tx, state, view, 100)) {
+            return false;
+        }
+
+        if (!tx.IsCoinBase())
+        {
+            if (!view.HaveInputs(tx))
+                return state.DoS(100, error("ConnectBlock(): inputs missing/spent"),
+                                 REJECT_INVALID, "bad-txns-inputs-missingorspent");
+
+            // 找到每个input来源的output，取出放到allPrevOutputs
+            for (const auto& input : tx.vin) {
+                allPrevOutputs.push_back(view.GetOutputFor(input));
+            }
+
+            // insightexplorer
+            // https://github.com/bitpay/bitcoin/commit/017f548ea6d89423ef568117447e61dd5707ec42#diff-7ec3c68a81efff79b6ca22ac1f1eabbaR2597
+            // 将销毁的信息记录到addressIndex、addressUnspentIndex和spentIndex，它们作为局部变量，原本都为空
+            if (fAddressIndex || fSpentIndex) {
+                for (size_t j = 0; j < tx.vin.size(); j++) {
+
+                    const CTxIn input = tx.vin[j];
+                    const CTxOut &prevout = allPrevOutputs[j];
+                    CScript::ScriptType scriptType = prevout.scriptPubKey.GetType();
+                    const uint160 addrHash = prevout.scriptPubKey.AddressHash();
+                    if (fAddressIndex && scriptType != CScript::UNKNOWN) {
+                        // record spending activity
+                        addressIndex.push_back(make_pair(
+                            CAddressIndexKey(scriptType, addrHash, pindex->nHeight, i, hash, j, true),
+                            prevout.nValue * -1));
+
+                        // remove address from unspent index
+                        addressUnspentIndex.push_back(make_pair(
+                            CAddressUnspentKey(scriptType, addrHash, input.prevout.hash, input.prevout.n),
+                            CAddressUnspentValue()));
+                    }
+                    if (fSpentIndex) {
+                        // Add the spent index to determine the txid and input that spent an output
+                        // and to find the amount and address from an input.
+                        // If we do not recognize the script type, we still add an entry to the
+                        // spentindex db, with a script type of 0 and addrhash of all zeroes.
+                        spentIndex.push_back(make_pair(
+                            CSpentIndexKey(input.prevout.hash, input.prevout.n),
+                            CSpentIndexValue(hash, j, pindex->nHeight, prevout.nValue, scriptType, addrHash)));
+                    }
+                }
+            }
+
+            // Add in sigops done by pay-to-script-hash inputs;
+            // this is to prevent a "rogue miner" from creating
+            // an incredibly-expensive-to-validate block.
+            // 操作数量检测，防止矿工制造过大的区块
+            nSigOps += GetP2SHSigOpCount(tx, view);
+            if (nSigOps > MAX_BLOCK_SIGOPS)
+                return state.DoS(100, error("ConnectBlock(): too many sigops"),
+                                 REJECT_INVALID, "bad-blk-sigops");
+        }
+
+        txdata.emplace_back(tx, allPrevOutputs);
+        // 检测是否支付fee以及fee的来源
+        if (!tx.IsCoinBase())
+        {
+            nFees += view.GetValueIn(tx)-tx.GetValueOut();
+
+            std::vector<CScriptCheck> vChecks;
+            if (!ContextualCheckInputs(tx, state, view, fExpensiveChecks, flags, fCacheResults, txdata.back(), chainparams.GetConsensus(), consensusBranchId, nScriptCheckThreads ? &vChecks : NULL))
+                return error("ConnectBlock(): CheckInputs on %s failed with %s",
+                    tx.GetHash().ToString(), FormatStateMessage(state));
+            control.Add(vChecks);
+        }
+
+        // Check shielded inputs.
+        // 检测每个隐匿input的上下文有效性，后面会提到
+        if (!ContextualCheckShieldedInputs(
+            tx,
+            txdata.back(),
+            state,
+            view,
+            saplingAuth,
+            orchardAuth,
+            chainparams.GetConsensus(),
+            consensusBranchId,
+            chainparams.GetConsensus().NetworkUpgradeActive(pindex->nHeight, Consensus::UPGRADE_NU5),
+            true))
+        {
+            return error(
+                "ConnectBlock(): ContextualCheckShieldedInputs() on %s failed with %s",
+                tx.GetHash().ToString(),
+                FormatStateMessage(state));
+        }
+
+        // insightexplorer
+        // https://github.com/bitpay/bitcoin/commit/017f548ea6d89423ef568117447e61dd5707ec42#diff-7ec3c68a81efff79b6ca22ac1f1eabbaR2656
+        // 将铸造的信息记录到addressIndex和addressUnspentIndex，它们作为局部变量，原本都为空
+        if (fAddressIndex) {
+            for (unsigned int k = 0; k < tx.vout.size(); k++) {
+                const CTxOut &out = tx.vout[k];
+                CScript::ScriptType scriptType = out.scriptPubKey.GetType();
+                if (scriptType != CScript::UNKNOWN) {
+                    uint160 const addrHash = out.scriptPubKey.AddressHash();
+
+                    // record receiving activity
+                    addressIndex.push_back(make_pair(
+                        CAddressIndexKey(scriptType, addrHash, pindex->nHeight, i, hash, k, false),
+                        out.nValue));
+
+                    // record unspent output
+                    addressUnspentIndex.push_back(make_pair(
+                        CAddressUnspentKey(scriptType, addrHash, hash, k),
+                        CAddressUnspentValue(out.nValue, out.scriptPubKey, pindex->nHeight)));
+                }
+            }
+        }
+
+        // 将销毁和铸造的结果暂存，同时准备好回滚需要的信息，以防万一
+        // void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txundo, int nHeight)
+        // {
+        //     // mark inputs spent
+        //     if (!tx.IsCoinBase()) {
+        //         txundo.vprevout.reserve(tx.vin.size());
+        //         for (const CTxIn &txin : tx.vin) {
+        //             CCoinsModifier coins = inputs.ModifyCoins(txin.prevout.hash);
+        //             unsigned nPos = txin.prevout.n;
+
+        //             if (nPos >= coins->vout.size() || coins->vout[nPos].IsNull())
+        //                 assert(false);
+        //             // mark an outpoint spent, and construct undo information
+        //             txundo.vprevout.push_back(CTxInUndo(coins->vout[nPos]));
+        //             coins->Spend(nPos);
+        //             if (coins->vout.size() == 0) {
+        //                 CTxInUndo& undo = txundo.vprevout.back();
+        //                 undo.nHeight = coins->nHeight;
+        //                 undo.fCoinBase = coins->fCoinBase;
+        //                 undo.nVersion = coins->nVersion;
+        //             }
+        //         }
+        //     }
+        //
+        //     // spend nullifiers
+        //     inputs.SetNullifiers(tx, true);
+        //
+        //     // add outputs
+        //     inputs.ModifyNewCoins(tx.GetHash())->FromTx(tx, nHeight);
+        // }
+        CTxUndo undoDummy;
+        if (i > 0) {
+            blockundo.vtxundo.push_back(CTxUndo());
+        }
+        UpdateCoins(tx, view, i == 0 ? undoDummy : blockundo.vtxundo.back(), pindex->nHeight);
+
+        // 将隐匿output的commitment添加到三个协议的incremental merkle tree
+        for (const JSDescription &joinsplit : tx.vJoinSplit) {
+            for (const uint256 &note_commitment : joinsplit.commitments) {
+                // Insert the note commitments into our temporary tree.
+
+                sprout_tree.append(note_commitment);
+            }
+        }
+
+        for (const OutputDescription &outputDescription : tx.vShieldedOutput) {
+            sapling_tree.append(outputDescription.cmu);
+        }
+
+        if (!orchard_tree.AppendBundle(tx.GetOrchardBundle())) {
+            return state.DoS(100,
+                error("ConnectBlock(): block would overfill the Orchard commitment tree."),
+                REJECT_INVALID, "orchard-commitment-tree-full");
+        };
+
+        if (!(tx.vShieldedSpend.empty() && tx.vShieldedOutput.empty())) {
+            total_sapling_tx += 1;
+        }
+
+        if (tx.GetOrchardBundle().IsPresent()) {
+            total_orchard_tx += 1;
+        }
+
+        vPos.push_back(std::make_pair(tx.GetHash(), pos));
+        pos.nTxOffset += ::GetSerializeSize(tx, SER_DISK, CLIENT_VERSION);
+    }
+
+    // ......
+
+    // 将插入新节点后的tree root缓存到cacheAnchors
+    // template<typename Tree, typename Cache, typename CacheIterator, typename CacheEntry>
+    // void CCoinsViewCache::AbstractPushAnchor(
+    //     const Tree &tree,
+    //     ShieldedType type,
+    //     Cache &cacheAnchors,
+    //     uint256 &hash
+    // )
+    // {
+    //     uint256 newrt = tree.root();
+    //
+    //     auto currentRoot = GetBestAnchor(type);
+    //
+    //     // We don't want to overwrite an anchor we already have.
+    //     // This occurs when a block doesn't modify mapAnchors at all,
+    //     // because there are no joinsplits. We could get around this a
+    //     // different way (make all blocks modify mapAnchors somehow)
+    //     // but this is simpler to reason about.
+    //     if (currentRoot != newrt) {
+    //         auto insertRet = cacheAnchors.insert(std::make_pair(newrt, CacheEntry()));
+    //         CacheIterator ret = insertRet.first;
+    //
+    //         ret->second.entered = true;
+    //         ret->second.tree = tree;
+    //         ret->second.flags = CacheEntry::DIRTY;
+    //
+    //         if (insertRet.second) {
+    //             // An insert took place
+    //             cachedCoinsUsage += ret->second.tree.DynamicMemoryUsage();
+    //         }
+    //
+    //         hash = newrt;
+    //     }
+    // }
+    view.PushAnchor(sprout_tree);
+    view.PushAnchor(sapling_tree);
+    view.PushAnchor(orchard_tree);
+    
+    // ......
+
+    int64_t nTime1 = GetTimeMicros(); nTimeConnect += nTime1 - nTimeStart;
+    LogPrint("bench", "      - Connect %u transactions: %.2fms (%.3fms/tx, %.3fms/txin) [%.2fs]\n", (unsigned)block.vtx.size(), 0.001 * (nTime1 - nTimeStart), 0.001 * (nTime1 - nTimeStart) / block.vtx.size(), nInputs <= 1 ? 0 : 0.001 * (nTime1 - nTimeStart) / (nInputs-1), nTimeConnect * 0.000001);
+
+    // 计算区块奖励，并且验证区块正确支付该奖励
+    CAmount blockReward = nFees + GetBlockSubsidy(pindex->nHeight, chainparams.GetConsensus());
+    if (block.vtx[0].GetValueOut() > blockReward)
+        return state.DoS(100,
+                         error("ConnectBlock(): coinbase pays too much (actual=%d vs limit=%d)",
+                               block.vtx[0].GetValueOut(), blockReward),
+                               REJECT_INVALID, "bad-cb-amount");
+
+    // ......
+
+    if (!control.Wait())
+        return state.DoS(100, false);
+    int64_t nTime2 = GetTimeMicros(); nTimeVerify += nTime2 - nTimeStart;
+    LogPrint("bench", "    - Verify %u txins: %.2fms (%.3fms/txin) [%.2fs]\n", nInputs - 1, 0.001 * (nTime2 - nTimeStart), nInputs <= 1 ? 0 : 0.001 * (nTime2 - nTimeStart) / (nInputs-1), nTimeVerify * 0.000001);
+
+    if (fJustCheck)
+        return true;
+
+    // Write undo information to disk
+    // 写入回滚数据
+    if (pindex->GetUndoPos().IsNull() || !pindex->IsValid(BLOCK_VALID_SCRIPTS))
+    {
+        if (pindex->GetUndoPos().IsNull()) {
+            CDiskBlockPos _pos;
+            if (!FindUndoPos(state, pindex->nFile, _pos, ::GetSerializeSize(blockundo, SER_DISK, CLIENT_VERSION) + 40))
+                return error("ConnectBlock(): FindUndoPos failed");
+            if (!UndoWriteToDisk(blockundo, _pos, pindex->pprev->GetBlockHash(), chainparams.MessageStart()))
+                return AbortNode(state, "Failed to write undo data");
+
+            // update nUndoPos in block index
+            pindex->nUndoPos = _pos.nPos;
+            pindex->nStatus |= BLOCK_HAVE_UNDO;
+        }
+
+        // Now that all consensus rules have been validated, set nCachedBranchId.
+        // Move this if BLOCK_VALID_CONSENSUS is ever altered.
+        static_assert(BLOCK_VALID_CONSENSUS == BLOCK_VALID_SCRIPTS,
+            "nCachedBranchId must be set after all consensus rules have been validated.");
+        if (IsActivationHeightForAnyUpgrade(pindex->nHeight, chainparams.GetConsensus())) {
+            pindex->nStatus |= BLOCK_ACTIVATES_UPGRADE;
+            pindex->nCachedBranchId = CurrentEpochBranchId(pindex->nHeight, chainparams.GetConsensus());
+        } else if (pindex->pprev) {
+            pindex->nCachedBranchId = pindex->pprev->nCachedBranchId;
+        }
+
+        pindex->RaiseValidity(BLOCK_VALID_SCRIPTS);
+        setDirtyBlockIndex.insert(pindex);
+    }
+
+    if (fTxIndex)
+        if (!pblocktree->WriteTxIndex(vPos))
+            return AbortNode(state, "Failed to write transaction index");
+
+    // START insightexplorer
+    // 写入之前记录的索引数据用于展示
+    if (fAddressIndex) {
+        if (!pblocktree->WriteAddressIndex(addressIndex)) {
+            return AbortNode(state, "Failed to write address index");
+        }
+        if (!pblocktree->UpdateAddressUnspentIndex(addressUnspentIndex)) {
+            return AbortNode(state, "Failed to write address unspent index");
+        }
+    }
+    if (fSpentIndex) {
+        if (!pblocktree->UpdateSpentIndex(spentIndex)) {
+            return AbortNode(state, "Failed to write spent index");
+        }
+    }
+    // 写入其他的信息
+    if (fTimestampIndex) {
+        unsigned int logicalTS = pindex->nTime;
+        unsigned int prevLogicalTS = 0;
+
+        // retrieve logical timestamp of the previous block
+        if (pindex->pprev)
+            if (!pblocktree->ReadTimestampBlockIndex(pindex->pprev->GetBlockHash(), prevLogicalTS))
+                LogPrintf("%s: Failed to read previous block's logical timestamp\n", __func__);
+
+        if (logicalTS <= prevLogicalTS) {
+            logicalTS = prevLogicalTS + 1;
+            LogPrintf("%s: Previous logical timestamp is newer Actual[%d] prevLogical[%d] Logical[%d]\n", __func__, pindex->nTime, prevLogicalTS, logicalTS);
+        }
+
+        if (!pblocktree->WriteTimestampIndex(CTimestampIndexKey(logicalTS, pindex->GetBlockHash())))
+            return AbortNode(state, "Failed to write timestamp index");
+
+        if (!pblocktree->WriteTimestampBlockIndex(CTimestampBlockIndexKey(pindex->GetBlockHash()), CTimestampBlockIndexValue(logicalTS)))
+            return AbortNode(state, "Failed to write blockhash index");
+    }
+    // END insightexplorer
+
+    // add this block to the view's block chain
+    // 将区块添加到当前区块链
+    view.SetBestBlock(pindex->GetBlockHash());
+
+    int64_t nTime3 = GetTimeMicros(); nTimeIndex += nTime3 - nTime2;
+    LogPrint("bench", "    - Index writing: %.2fms [%.2fs]\n", 0.001 * (nTime3 - nTime2), nTimeIndex * 0.000001);
+
+    return true;
+}
+```
+
+除了常见的区块数据遍历和写入过程，我们需要关注到`CheckTxShieldedInputs()`和`ContextualCheckShieldedInputs()`。我们按照逻辑顺序，先看前者，
+
+```cpp
+bool CheckTxShieldedInputs(
+    const CTransaction& tx,
+    CValidationState& state,
+    const CCoinsViewCache& view,
+    int dosLevel)
+{
+    // Are the shielded spends' requirements met?
+    auto unmetShieldedReq = view.CheckShieldedRequirements(tx);
+    if (!unmetShieldedReq.has_value()) {
+        auto txid = tx.GetHash().ToString();
+        auto rejectCode = ShieldedReqRejectCode(unmetShieldedReq.error());
+        auto rejectReason = ShieldedReqRejectReason(unmetShieldedReq.error());
+        TracingDebug(
+            "main", "CheckTxShieldedInputs(): shielded requirements not met",
+            "txid", txid.c_str(),
+            "reason", rejectReason.c_str());
+        return state.DoS(dosLevel, false, rejectCode, rejectReason);
+    }
+
+    return true;
+}
+```
+
+注释也说明，这是对隐匿输入合法性的验证，可以看到又调用到了`CheckShieldedRequirements()`，我们只看其中的Sprout部分，
+
+```cpp
+tl::expected<void, UnsatisfiedShieldedReq> CCoinsViewCache::CheckShieldedRequirements(const CTransaction& tx) const
+{
+    boost::unordered_map<uint256, SproutMerkleTree, SaltedTxidHasher> intermediates;
+
+    // 遍历每一个JSDescription
+    for (const JSDescription &joinsplit : tx.vJoinSplit)
+    {
+        // 首先在nullifier集合中查找是否有重复的，抛出双花错误
+        for (const uint256& nullifier : joinsplit.nullifiers)
+        {
+            if (GetNullifier(nullifier, SPROUT)) {
+                // If the nullifier is set, this transaction
+                // double-spends!
+                auto txid = tx.GetHash().ToString();
+                auto nf = nullifier.ToString();
+                TracingWarn("consensus", "Sprout double-spend detected",
+                    "txid", txid.c_str(),
+                    "nf", nf.c_str());
+                return tl::unexpected(UnsatisfiedShieldedReq::SproutDuplicateNullifier);
+            }
+        }
+
+        // 找到当前JoinSplit的状态锚点，JoinSplit的构建过程可以看前面
+        // 先从intermediates找，它是一个本地变量，方便处理前后有零钱继承的JoinSplit关系
+        // 再从SproutMerkleTree找，它是一个查找难度更大的结构
+        // 对于第一个JoinSplit，它的state anchor会通过GetSproutAnchorAt找到，读取了cacheSproutAnchors
+        // bool CCoinsViewCache::GetSproutAnchorAt(const uint256 &rt, SproutMerkleTree &tree) const {
+        //     CAnchorsSproutMap::const_iterator it = cacheSproutAnchors.find(rt);
+        //     if (it != cacheSproutAnchors.end()) {
+        //         if (it->second.entered) {
+        //             tree = it->second.tree;
+        //             return true;
+        //         } else {
+        //             return false;
+        //         }
+        //     }
+        //
+        //     if (!base->GetSproutAnchorAt(rt, tree)) {
+        //         return false;
+        //     }
+        //
+        //     CAnchorsSproutMap::iterator ret = cacheSproutAnchors.insert(std::make_pair(rt, CAnchorsSproutCacheEntry())).first;
+        //     ret->second.entered = true;
+        //     ret->second.tree = tree;
+        //     cachedCoinsUsage += ret->second.tree.DynamicMemoryUsage();
+        //
+        //     return true;
+        // }
+        SproutMerkleTree tree;
+        auto it = intermediates.find(joinsplit.anchor);
+        if (it != intermediates.end()) {
+            tree = it->second;
+        } else if (!GetSproutAnchorAt(joinsplit.anchor, tree)) {
+            auto txid = tx.GetHash().ToString();
+            auto anchor = joinsplit.anchor.ToString();
+            TracingWarn("consensus", "Transaction uses unknown Sprout anchor",
+                "txid", txid.c_str(),
+                "anchor", anchor.c_str());
+            return tl::unexpected(UnsatisfiedShieldedReq::SproutUnknownAnchor);
+        }
+        // 将commitment添加到树
+        for (const uint256& commitment : joinsplit.commitments)
+        {
+            tree.append(commitment);
+        }
+        // 将当前的树做一个缓存，后续的零钱处理会变得简单
+        intermediates.insert(std::make_pair(tree.root(), tree));
+    }
+
+    // ......
+
+    return {};
+}
+```
+
+然后是上下文检查，Sprout主要是验证了JoinSplit的签名，Sapling和Orchard做了不同的事，我们以后再做描述，
+
+```cpp
+bool ContextualCheckShieldedInputs(
+        const CTransaction& tx,
+        const PrecomputedTransactionData& txdata,
+        CValidationState &state,
+        const CCoinsViewCache &view,
+        std::optional<rust::Box<sapling::BatchValidator>>& saplingAuth,
+        std::optional<orchard::AuthValidator>& orchardAuth,
+        const Consensus::Params& consensus,
+        uint32_t consensusBranchId,
+        bool nu5Active,
+        bool isMined,
+        bool (*isInitBlockDownload)(const Consensus::Params&))
+{
+    // This doesn't trigger the DoS code on purpose; if it did, it would make it easier
+    // for an attacker to attempt to split the network.
+    if (!Consensus::CheckTxShieldedInputs(tx, state, view, 0)) {
+        return false;
+    }
+
+    const int DOS_LEVEL_BLOCK = 100;
+    // DoS level set to 10 to be more forgiving.
+    const int DOS_LEVEL_MEMPOOL = 10;
+
+    // For rules that are relaxing (or might become relaxing when a future
+    // network upgrade is implemented), we need to account for IBD mode.
+    auto dosLevelPotentiallyRelaxing = isMined ? DOS_LEVEL_BLOCK : (
+        isInitBlockDownload(consensus) ? 0 : DOS_LEVEL_MEMPOOL);
+
+    auto prevConsensusBranchId = PrevEpochBranchId(consensusBranchId, consensus);
+    uint256 dataToBeSigned;
+    uint256 prevDataToBeSigned;
+
+    // Create signature hashes for shielded components.
+    if (!tx.vJoinSplit.empty() ||
+        !tx.vShieldedSpend.empty() ||
+        !tx.vShieldedOutput.empty() ||
+        tx.GetOrchardBundle().IsPresent())
+    {
+        // Empty output script.
+        CScript scriptCode;
+        try {
+            dataToBeSigned = SignatureHash(scriptCode, tx, NOT_AN_INPUT, SIGHASH_ALL, 0, consensusBranchId, txdata);
+            prevDataToBeSigned = SignatureHash(scriptCode, tx, NOT_AN_INPUT, SIGHASH_ALL, 0, prevConsensusBranchId, txdata);
+        } catch (std::logic_error ex) {
+            // A logic error should never occur because we pass NOT_AN_INPUT and
+            // SIGHASH_ALL to SignatureHash().
+            return state.DoS(100, error("ContextualCheckShieldedInputs(): error computing signature hash"),
+                             REJECT_INVALID, "error-computing-signature-hash");
+        }
+    }
+
+    if (!tx.vJoinSplit.empty())
+    {
+        if (!ed25519_verify(&tx.joinSplitPubKey, &tx.joinSplitSig, dataToBeSigned.begin(), 32)) {
+            // Check whether the failure was caused by an outdated consensus
+            // branch ID; if so, inform the node that they need to upgrade. We
+            // only check the previous epoch's branch ID, on the assumption that
+            // users creating transactions will notice their transactions
+            // failing before a second network upgrade occurs.
+            if (ed25519_verify(&tx.joinSplitPubKey,
+                               &tx.joinSplitSig,
+                               prevDataToBeSigned.begin(), 32)) {
+                return state.DoS(
+                    dosLevelPotentiallyRelaxing, false, REJECT_INVALID, strprintf(
+                        "old-consensus-branch-id (Expected %s, found %s)",
+                        HexInt(consensusBranchId),
+                        HexInt(prevConsensusBranchId)));
+            }
+            return state.DoS(
+                dosLevelPotentiallyRelaxing,
+                error("ContextualCheckShieldedInputs(): invalid joinsplit signature"),
+                REJECT_INVALID, "bad-txns-invalid-joinsplit-signature");
+        }
+    }
+
+    // ......
+
+    return true;
+}
+```
+
+## 小结
+
+本篇介绍了Sprout协议在Zcash中的具体实施细节，包括证明的生成、交易的构建、交易的验证和证明的验证。

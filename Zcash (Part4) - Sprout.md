@@ -1,4 +1,4 @@
-# zk-SNARK (Part3)
+# Zcash Part4
 
 接上文，我们已经介绍了Groth16的定义，包括参数的预设、证明的生成、验证，以及复现论据的模拟过程。接下来，我们先从Zcash的Sprout和Sapling协议入手，看一看Zcash如何实现zk-SNARK和隐匿交易。
 

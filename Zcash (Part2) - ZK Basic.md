@@ -1,4 +1,4 @@
-# zk-SNARK (Part1)
+# Zcash Part2
 
 ## NP问题
 

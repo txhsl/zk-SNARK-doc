@@ -1,4 +1,4 @@
-# Zcash
+# Zcash Part1
 
 Zcash旨在实现匿名安全的UTXO链上交易，通过使用zk-SNARK(Zero-Knowledge Succinct Non-Interactive Argument of Knowledge，无交互的、简要的、零知识的内容论证)隐藏交易中包含的地址、数额以及附加消息。交易双方可以自行验证交易的有效性，或是将有限的部分数据提供给可信的第三方进行审计。
 

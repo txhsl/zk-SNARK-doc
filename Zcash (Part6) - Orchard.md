@@ -1,4 +1,4 @@
-# zk-SNARK (Part5)
+# Zcash Part6
 
 ## Orchard
 

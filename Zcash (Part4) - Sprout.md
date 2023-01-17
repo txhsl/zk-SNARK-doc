@@ -13,7 +13,7 @@ Zcash中的zk-SNARK总是证明两件事：
 
 ### zcash入口
 
-先上JoinSplit的证明入口，在[zcash/zcash/src/zcash/JoinSplit.cpp](https://github.com/zcash/zcash/blob/master/src/zcash/JoinSplit.cpp)，该入口接收来自Zcash其他模块的结构输入，每个JoinSplit都包含2个input和2个output，分别有一个或者两个可为空，同时包含一个vpub_old和vpub_new，分别可都为零。需要注意的是`input.value`和`output.value`代表Sprout隐匿资产池的销毁和铸造数量，而`vpub_old`和`vpub_new`代表公开资产池的销毁和铸造数量，别担心，我们会在平衡验证的描述中具体解释。
+先上JoinSplit的证明入口，在[zcash/zcash/src/zcash/JoinSplit.cpp](https://github.com/zcash/zcash/blob/df08281f253bab4fc489a0c1e754799e9af96f23/src/zcash/JoinSplit.cpp)，该入口接收来自Zcash其他模块的结构输入，每个JoinSplit都包含2个input和2个output，分别有一个或者两个可为空，同时包含一个vpub_old和vpub_new，分别可都为零。需要注意的是`input.value`和`output.value`代表Sprout隐匿资产池的销毁和铸造数量，而`vpub_old`和`vpub_new`代表公开资产池的销毁和铸造数量，别担心，我们会在平衡验证的描述中具体解释。
 
 ```cpp
 template<size_t NumInputs, size_t NumOutputs>
@@ -222,7 +222,7 @@ SproutProof JoinSplit<NumInputs, NumOutputs>::prove(
 
 #### 参数准备
 
-zcash/zcash中的`librustzcash_sprout_prove`实际引用到了[zcash/librustzcash/zcash_proofs/src/sprout.rs](https://github.com/zcash/librustzcash/blob/main/zcash_proofs/src/sprout.rs)，对应以下内容，
+zcash/zcash中的`librustzcash_sprout_prove`实际引用到了[zcash/librustzcash/zcash_proofs/src/sprout.rs](https://github.com/zcash/librustzcash/blob/5bf36989e20d0b9745fa906d918966f74106933c/zcash_proofs/src/sprout.rs)，对应以下内容，
 
 ```rust
 /// Sprout JoinSplit proof generation.
@@ -359,7 +359,7 @@ pub fn create_proof(
 
 #### 证明电路
 
-这个电路的定义在[zcash/librustzcash/zcash_proofs/src/circuit/sprout/mod.rs](https://github.com/zcash/librustzcash/blob/main/zcash_proofs/src/circuit/sprout/mod.rs#L57)，对应下面的代码，
+这个电路的定义在[zcash/librustzcash/zcash_proofs/src/circuit/sprout/mod.rs](https://github.com/zcash/librustzcash/blob/620ff21005017f625c4b5720561b76cb62048628/zcash_proofs/src/circuit/sprout/mod.rs#L57)，对应下面的代码，
 
 ```rust
 impl<Scalar: PrimeField> Circuit<Scalar> for JoinSplit {
@@ -523,7 +523,7 @@ impl<Scalar: PrimeField> Circuit<Scalar> for JoinSplit {
 以上代码按照顺序包含了以下操作：
 
 1. 验证input和output的数量都为2；
-2. 见证`vpub_old`、`vpub_new`、merkle tree root `rt`、`h_sig`和`phi`，使用到了新结构[`NoteValue`](https://github.com/zcash/librustzcash/blob/main/zcash_proofs/src/circuit/sprout/mod.rs#L220)和方法[`witness_u256`](https://github.com/zcash/librustzcash/blob/main/zcash_proofs/src/circuit/sprout/mod.rs#L320)；
+2. 见证`vpub_old`、`vpub_new`、merkle tree root `rt`、`h_sig`和`phi`，使用到了新结构[`NoteValue`](https://github.com/zcash/librustzcash/blob/620ff21005017f625c4b5720561b76cb62048628/zcash_proofs/src/circuit/sprout/mod.rs#L220)和方法[`witness_u256`](https://github.com/zcash/librustzcash/blob/620ff21005017f625c4b5720561b76cb62048628/zcash_proofs/src/circuit/sprout/mod.rs#L320)；
 
 ```rust
 pub struct NoteValue {
@@ -659,7 +659,7 @@ where
 9. enforce验证统计的input value总和output value总和相等，`lhs * 1 = rhs`，需要注意的是，`rhs = vpub_new.lc() + outputs[0].value.lc() + outputs[1].value.lc()`，其中每一项都必为正数，且`output.value`必然和上一步生成Note的value相同；
 10. 将`rt`、`h_sig`、`nf`、`mac`、`cm`、`vpub_old`、`vpub_new`打包为public inputs。
 
-在第4步声明中，又嵌套了另一个电路[InputNote](https://github.com/zcash/librustzcash/blob/main/zcash_proofs/src/circuit/sprout/input.rs)计算note的mac和nf，也做了一些进一步的验证，
+在第4步声明中，又嵌套了另一个电路[InputNote](https://github.com/zcash/librustzcash/blob/620ff21005017f625c4b5720561b76cb62048628/zcash_proofs/src/circuit/sprout/input.rs)计算note的mac和nf，也做了一些进一步的验证，
 
 ```rust
 impl InputNote {
@@ -770,7 +770,7 @@ impl InputNote {
 
 在返回mac和nf之前，上述方法做以下几件事：
 
-1. 见证`a_sk`、`rho`、`r`，计算并见证了`a_pk`、`nf`、`mac`和`cm`，方法`prf_a_pk`、`prf_nf`、`prf_pk`的定义可见[此处](https://github.com/zcash/librustzcash/blob/main/zcash_proofs/src/circuit/sprout/prfs.rs)，最终都调用了以下`prf`方法，组装一个vector后调用bellman提供的[sha256_block_no_padding](https://github.com/zkcrypto/bellman/blob/main/src/gadgets/sha256.rs#L29)，而方法`note_comm`则调用了bellman一个有padding的[sha256](https://github.com/zkcrypto/bellman/blob/main/src/gadgets/sha256.rs#L47)方法；
+1. 见证`a_sk`、`rho`、`r`，计算并见证了`a_pk`、`nf`、`mac`和`cm`，方法`prf_a_pk`、`prf_nf`、`prf_pk`的定义可见[此处](https://github.com/zcash/librustzcash/blob/620ff21005017f625c4b5720561b76cb62048628/zcash_proofs/src/circuit/sprout/prfs.rs)，最终都调用了以下`prf`方法，组装一个vector后调用bellman提供的[sha256_block_no_padding](https://github.com/zkcrypto/bellman/blob/5e4e3ae15a723f2cb1f331becc46b1495a5e0cf8/src/gadgets/sha256.rs#L29)，而方法`note_comm`则调用了bellman一个有padding的[sha256](https://github.com/zkcrypto/bellman/blob/5e4e3ae15a723f2cb1f331becc46b1495a5e0cf8/src/gadgets/sha256.rs#L47)方法；
 
 ```rust
 fn prf<Scalar, CS>(
@@ -993,7 +993,7 @@ for (i, layer) in auth_path.iter().enumerate() {
 5. 最后check merkel root，前面我们已经通过迭代在电路中算出一个root `cur`，这里逐字节比较`cur`和`rt`，enforce `(cur - rt) * enforce = 0`，这里如果`enforce == 0`代表input为空；
 6. 返回组装好的InputNote。
 
-我们也能找到关于交易输出的[OutputNote](https://github.com/zcash/librustzcash/blob/main/zcash_proofs/src/circuit/sprout/output.rs)电路，
+我们也能找到关于交易输出的[OutputNote](https://github.com/zcash/librustzcash/blob/620ff21005017f625c4b5720561b76cb62048628/zcash_proofs/src/circuit/sprout/output.rs)电路，
 
 ```rust
 impl OutputNote {
@@ -1040,7 +1040,7 @@ impl OutputNote {
 
 #### 证明生成
 
-准备好电路和参数后，方法再调用到[zkcrypto/bellman/src/groth16/prover.rs](https://github.com/zkcrypto/bellman/blob/main/src/groth16/prover.rs)生成证明。
+准备好电路和参数后，方法再调用到[zkcrypto/bellman/src/groth16/prover.rs](https://github.com/zkcrypto/bellman/blob/46b5a6e6e9ee088bc0c61f49709c2f934514df73/src/groth16/prover.rs)生成证明。
 
 ```rust
 pub fn create_random_proof<E, C, R, P: ParameterSource<E>>(
@@ -1256,7 +1256,7 @@ where
 
 #### ProvingAssignment
 
-在方法的开头，我们的prover被初始化为`ProvingAssignment`类型，后者在[代码声明](https://github.com/zkcrypto/bellman/blob/main/src/groth16/prover.rs#L57)中是如下的结构体：
+在方法的开头，我们的prover被初始化为`ProvingAssignment`类型，后者在[代码声明](https://github.com/zkcrypto/bellman/blob/46b5a6e6e9ee088bc0c61f49709c2f934514df73/src/groth16/prover.rs#L57)中是如下的结构体：
 
 ```rust
 struct ProvingAssignment<S: PrimeField> {
@@ -1376,7 +1376,7 @@ impl<S: PrimeField> ConstraintSystem<S> for ProvingAssignment<S> {
 
 ### 交易结构
 
-直接上Zcash的交易结构定义，在[zcash/zcash/src/primitives/transaction.h](https://github.com/zcash/zcash/blob/master/src/primitives/transaction.h#L703)，
+直接上Zcash的交易结构定义，在[zcash/zcash/src/primitives/transaction.h](https://github.com/zcash/zcash/blob/28040f9ce4120623854981a24420e3f956f33e38/src/primitives/transaction.h#L703)，
 
 ```cpp
 /** The basic transaction that is broadcasted on the network and contained in
@@ -1462,7 +1462,7 @@ public:
 }
 ```
 
-然后是JSDescription的定义，在[同一文件](https://github.com/zcash/zcash/blob/master/src/primitives/transaction.h#L378)，
+然后是JSDescription的定义，在[同一文件](https://github.com/zcash/zcash/blob/28040f9ce4120623854981a24420e3f956f33e38/src/primitives/transaction.h#L378)，
 
 ```cpp
 class JSDescription
@@ -1902,7 +1902,7 @@ return true;
 
 ### 上下文无关验证
 
-根据一些众所周知的常识，作为Verifier的Zcash节点首先以区块的形式接收到交易，我们可以在[zcash/zcash/src/main.cpp](https://github.com/zcash/zcash/blob/master/src/main.cpp#L4753)找到这个入口，
+根据一些众所周知的常识，作为Verifier的Zcash节点首先以区块的形式接收到交易，我们可以在[zcash/zcash/src/main.cpp](https://github.com/zcash/zcash/blob/b63c58500a800938819a3bd9c1e78a7f6f9c787a/src/main.cpp#L4753)找到这个入口，
 
 ```cpp
 bool CheckBlock(const CBlock& block,
@@ -2025,7 +2025,7 @@ uint256 BlockMerkleRoot(const CBlock& block, bool* mutated)
 }
 ```
 
-Zcash交易验证的过程发生在[`CheckTransaction()`](https://github.com/zcash/zcash/blob/master/src/main.cpp#L1381)，对应如下代码，
+Zcash交易验证的过程发生在[`CheckTransaction()`](https://github.com/zcash/zcash/blob/b63c58500a800938819a3bd9c1e78a7f6f9c787a/src/main.cpp#L1381)，对应如下代码，
 
 ```cpp
 bool CheckTransaction(const CTransaction& tx, CValidationState &state,
@@ -2057,7 +2057,7 @@ bool CheckTransaction(const CTransaction& tx, CValidationState &state,
 }
 ```
 
-其中的`CheckTransactionWithoutProofVerification()`也定义在在[zcash/zcash/src/main.cpp](https://github.com/zcash/zcash/blob/master/src/main.cpp#L1418)，下面截取其中和Sprout有关的一部分，
+其中的`CheckTransactionWithoutProofVerification()`也定义在在[zcash/zcash/src/main.cpp](https://github.com/zcash/zcash/blob/b63c58500a800938819a3bd9c1e78a7f6f9c787a/src/main.cpp#L1418)，下面截取其中和Sprout有关的一部分，
 
 ```cpp
 /**
@@ -2247,7 +2247,7 @@ bool ProofVerifier::VerifySprout(
 
 ### 上下文验证
 
-上下文有关的区块验证同样发生在[zcash/zcash/src/main.cpp](https://github.com/zcash/zcash/blob/master/src/main.cpp#L4896)，对应下面的代码，
+上下文有关的区块验证同样发生在[zcash/zcash/src/main.cpp](https://github.com/zcash/zcash/blob/b63c58500a800938819a3bd9c1e78a7f6f9c787a/src/main.cpp#L4896)，对应下面的代码，
 
 ```cpp
 bool ContextualCheckBlock(

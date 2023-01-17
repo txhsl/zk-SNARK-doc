@@ -2,13 +2,15 @@
 
 ## Sapling
 
-看完了Sprout，我们来看Sapling，这个协议只对每一个input和output生成分别的证明。在之前的内容中，我们已经知道Sapling是在Sprout基础上重建的协议，甚至地址上可以相互兼容。
+看完了Sprout，我们来看Sapling，这个协议只对每一个input和output生成分别的证明。在上一节中我们知道，Sprout协议处理复杂交易时JoinSplit要完成零钱Note的反复铸造和销毁，毫无疑问在性能上有很大的提升空间。
+
+针对Sprout协议存在的性能短板，Zcash提出了作为改进的Sapling协议。在之前的内容中，我们已经知道Sapling是在Sprout基础上重建的协议，甚至地址上可以相互兼容，因此它们的相似程度也非常高。
 
 ### zcash入口
 
-为了把使用Rust编写的新内容放进原有使用C++编写的Sprout节点中，Sapling的定义添加在[zcash/src/rust/src](https://github.com/zcash/zcash/tree/master/src/rust/src)下。我们先看Sapling。
+为了把使用Rust编写的新内容放进原有使用C++编写的Sprout节点中，Sapling的定义添加在[zcash/zcash/src/rust/src](https://github.com/zcash/zcash/tree/master/src/rust/src)下。我们先看Sapling。
 
-先找到Sapling证明的Prover入口，它在[zcash/zcash//src/rust/src/sapling.rs](https://github.com/zcash/zcash/blob/master/src/rust/src/sapling.rs#L263)，对应的spend代码如下，
+先找到Sapling证明的Prover入口，它在[zcash/zcash/src/rust/src/sapling.rs](https://github.com/zcash/zcash/blob/3ef12e98c1ec22372cb971f28eaf18cbb7bbb1f6/src/rust/src/sapling.rs#L263)，对应的Spend代码如下，
 
 ```rust
 fn create_spend_proof(
@@ -107,7 +109,17 @@ fn create_spend_proof(
 }
 ```
 
-以上是对input的证明入口，这里接收数据后做了一些验证，向外部调用，然后将返回的证明写入`zkproof`返回。下面还有对output的证明入口，
+以上是对input的证明入口，这里接收数据后做一些验证，用`ask`、`nsk`生成了证明生成密钥，然后向外部调用，将返回的证明写入`zkproof`返回，同时返回的还有公开参数`cv`和`rk`。
+
+这里没有Sprout一样的参数检测和说明，简单介绍一下使用的参数，可以回看Part1，
+
+1. expanded spending key中的`ask`、`nsk`，`ask`这里写作了`ak`；
+3. note中的`d`、`rcm`和`v`，`v`这里写作了`value`；
+4. spend note的`anchor`，即Sapling Incremental Tree的merkel root；
+5. 一个指定的随机种子`alpha`，这里写作了`ar`；
+6. spend note commitment的merkle tree path，这里写作了`merkle_path`。
+
+同一位置的下方还有对output的证明入口，
 
 ```rust
 fn create_output_proof(
@@ -158,11 +170,13 @@ fn create_output_proof(
 }
 ```
 
+和上面spend proof不同的是，这里使用了额外的参数`esk`、`payment_address`，前者是secret sharing中的加密私钥，后者是Sapling中的接收地址。
+
 ### librustzcash中转
 
 #### 参数准备
 
-这里生成证明的调用是`spend_proof`，我们可以在[zcash/librustzcash/zcash_proofs/src/sapling/prover.rs](https://github.com/zcash/librustzcash/blob/main/zcash_proofs/src/sapling/prover.rs#L48)找到，对应下面的代码，
+这里生成证明的调用是`spend_proof`，我们可以在[zcash/librustzcash/zcash_proofs/src/sapling/prover.rs](https://github.com/zcash/librustzcash/blob/23922ca290e300db3252e484dfdcd18c17ed75ee/zcash_proofs/src/sapling/prover.rs#L48)找到，对应下面的代码，
 
 ```rust
 /// Create the value commitment, re-randomized key, and proof for a Sapling
@@ -280,7 +294,60 @@ pub fn spend_proof(
 }
 ```
 
-以上方法发挥和Sprout中`create_proof`类似的作用，准备好Groth16需要的电路和参数，收到证明后处理nullifier和value commitment。当然`output_proof`也出现在相同的位置，
+以上方法发挥和Sprout中`create_proof`类似的作用，准备好Groth16需要的电路和参数，收到证明后处理nullifier和value commitment。
+
+我们还记得Sprout中JoinSplit电路的公开参数包括anchor root、`h_sig`、nullifier、`mac`、commitment以及`vpub_old`和`vpub_new`。而这里Spend电路的公开参数则是anchor root、`rk`、nullifier和commitment。
+
+比较重要的一点是`self.cv_sum += value_commitment;`，**我们看到commitment被用于value的平衡验证，这一点不再是通过证明完成**。以及`let rcv = jubjub::Fr::random(&mut rng);`，这个随机元被用于混淆保护`value`的值不被推测。`ValueCommitment`的[定义](https://github.com/zcash/librustzcash/blob/23922ca290e300db3252e484dfdcd18c17ed75ee/zcash_primitives/src/sapling/value.rs#L107)如下，
+
+```rust
+#[derive(Clone, Debug)]
+pub struct ValueCommitment(jubjub::ExtendedPoint);
+
+impl ValueCommitment {
+    /// Derives a `ValueCommitment` by $\mathsf{ValueCommit^{Sapling}}$.
+    ///
+    /// Defined in [Zcash Protocol Spec § 5.4.8.3: Homomorphic Pedersen commitments (Sapling and Orchard)][concretehomomorphiccommit].
+    ///
+    /// [concretehomomorphiccommit]: https://zips.z.cash/protocol/protocol.pdf#concretehomomorphiccommit
+    pub fn derive(value: NoteValue, rcv: ValueCommitTrapdoor) -> Self {
+        let cv = (VALUE_COMMITMENT_VALUE_GENERATOR * jubjub::Scalar::from(value.0))
+            + (VALUE_COMMITMENT_RANDOMNESS_GENERATOR * rcv.0);
+
+        ValueCommitment(cv.into())
+    }
+
+    /// Returns the inner Jubjub point representing this value commitment.
+    ///
+    /// This is public for access by `zcash_proofs`.
+    pub fn as_inner(&self) -> &jubjub::ExtendedPoint {
+        &self.0
+    }
+
+    /// Deserializes a value commitment from its byte representation.
+    ///
+    /// Returns `None` if `bytes` is an invalid representation of a Jubjub point, or the
+    /// resulting point is of small order.
+    ///
+    /// This method can be used to enforce the "not small order" consensus rules defined
+    /// in [Zcash Protocol Spec § 4.4: Spend Descriptions][spenddesc] and
+    /// [§ 4.5: Output Descriptions][outputdesc].
+    ///
+    /// [spenddesc]: https://zips.z.cash/protocol/protocol.pdf#spenddesc
+    /// [outputdesc]: https://zips.z.cash/protocol/protocol.pdf#outputdesc
+    pub fn from_bytes_not_small_order(bytes: &[u8; 32]) -> CtOption<ValueCommitment> {
+        jubjub::ExtendedPoint::from_bytes(bytes)
+            .and_then(|cv| CtOption::new(ValueCommitment(cv), !cv.is_small_order()))
+    }
+
+    /// Serializes this value commitment to its canonical byte representation.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.0.to_bytes()
+    }
+}
+```
+
+当然`output_proof`也出现在相同的位置，依然关注`bsk`和`cv_sum`，后面会用到，
 
 ```rust
 /// Create the value commitment and proof for a Sapling OutputDescription,

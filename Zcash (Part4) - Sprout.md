@@ -11,7 +11,7 @@ Zcash中的zk-SNARK总是证明两件事：
 
 我们按照从下往上的顺序，先看最为基础的JoinSplit数据结构和Zcash在隐匿交易中完成的证明。
 
-### zcash入口
+### Zcash入口
 
 先上JoinSplit的证明入口，在[zcash/zcash/src/zcash/JoinSplit.cpp](https://github.com/zcash/zcash/blob/df08281f253bab4fc489a0c1e754799e9af96f23/src/zcash/JoinSplit.cpp)，该入口接收来自Zcash其他模块的结构输入，每个JoinSplit都包含2个input和2个output，分别有一个或者两个可为空，同时包含一个vpub_old和vpub_new，分别可都为零。需要注意的是`input.value`和`output.value`代表Sprout隐匿资产池的销毁和铸造数量，而`vpub_old`和`vpub_new`代表公开资产池的销毁和铸造数量，别担心，我们会在平衡验证的描述中具体解释。
 
@@ -218,7 +218,7 @@ SproutProof JoinSplit<NumInputs, NumOutputs>::prove(
     - 每个note的witness的sprout merkle tree path；
     - 生成的每个output note的`a_pk`、`v`、`r`。
 
-### librustzcash中转
+### Librustzcash中转
 
 #### 参数准备
 
@@ -1036,7 +1036,7 @@ impl OutputNote {
 
 在三个电路中我们可以看到名为`ConstraintSystem`的参数空间贯穿始终。在下面的证明生成中我们可以看到它的初始化。
 
-### bellman计算
+### Bellman计算
 
 #### 证明生成
 
@@ -1254,7 +1254,7 @@ where
 
 以上方法直接接受电路`C`和参数`P`，完成了最后的证明生成过程。一条完整的Sprout生成JoinSplit证明的调用线到此为止。
 
-#### ProvingAssignment
+#### Proving Assignment
 
 在方法的开头，我们的prover被初始化为`ProvingAssignment`类型，后者在[代码声明](https://github.com/zkcrypto/bellman/blob/46b5a6e6e9ee088bc0c61f49709c2f934514df73/src/groth16/prover.rs#L57)中是如下的结构体：
 

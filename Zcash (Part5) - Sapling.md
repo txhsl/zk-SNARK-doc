@@ -6,7 +6,7 @@
 
 针对Sprout协议存在的性能短板，Zcash提出了作为改进的Sapling协议。在之前的内容中，我们已经知道Sapling是在Sprout基础上重建的协议，甚至地址上可以相互兼容，因此它们的相似程度也非常高。
 
-### zcash入口
+### Zcash入口
 
 为了把使用Rust编写的新内容放进原有使用C++编写的Sprout节点中，Sapling的定义添加在[zcash/zcash/src/rust/src](https://github.com/zcash/zcash/tree/master/src/rust/src)下。我们先看Sapling。
 
@@ -172,7 +172,7 @@ fn create_output_proof(
 
 和上面spend proof不同的是，这里使用了额外的参数`esk`、`payment_address`，前者是secret sharing中的加密私钥，后者是Sapling中的接收地址。
 
-### librustzcash中转
+### Librustzcash中转
 
 #### 参数准备
 
@@ -1710,10 +1710,10 @@ where
 }
 ```
 
-#### pedersen hash
+#### Pedersen Hash
 
-#### blake2s
+#### Blake2s
 
-### bellman计算
+### Bellman计算
 
 Sapling后面调用bellman生成证明时，同样使用了`create_random_proof`，因此过程和之前一样，以及使用了相同的`ProvingAssignment`，不再赘述。

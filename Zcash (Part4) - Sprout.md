@@ -3048,6 +3048,16 @@ bool ContextualCheckShieldedInputs(
 }
 ```
 
+## 漏洞
+
+2018年3月1日，Zcash雇佣的密码学家曾发现Sprout使用的加密方案存在漏洞，该漏洞允许攻击者创建有效的伪造屏蔽值。只要Sprout资金池的总资产大于0，攻击者就可以利用该漏洞从资金池印取有效的note commitment。
+
+在旧版的使用BCTV14方案的代码中，一些未被使用的元素被计算了出来，并且它们的出现允许作弊证明者绕过一致性检查，将一个statement的证明转化为另一个statement的有效证明，从而完成伪造。为BCTV14生成初始参数的MPC过程同样包含了额外的计算，因此这个问题贯穿Sprout协议始终。
+
+2018年10月28日，Zcash在上线Sapling协议的同时，将Sprout使用的加密方案也升级到了Groth16，后者被认为不存在伪造漏洞。
+
+该漏洞的具体细节直到2019年才被披露，发布于[CVE-2019-7167](https://nvd.nist.gov/vuln/detail/CVE-2019-7167)，在国家信息安全漏洞共享平台也可找到相关记录[CNVD-2020-40888](https://www.cnvd.org.cn/flaw/show/CNVD-2020-40888)。
+
 ## 小结
 
 本篇介绍了Sprout协议在Zcash中的具体实施细节，包括证明的生成、交易的构建、交易的验证和证明的验证。

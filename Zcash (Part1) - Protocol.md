@@ -287,7 +287,7 @@ Sapling协议使用了同态加密来处理input和output标明的资产数量�
 
 ![Binding signature](https://img-blog.csdnimg.cn/20190727233038401.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L1R1cmtleUNvY2s=,size_16,color_FFFFFF,t_70)
 
-如同之前提到的一样，这里用到了同态加密。Prover对每一个Spend description和Output description都取得一个随机数$rcv$并连同value $v$一起加密为$cv$。
+如同之前提到的一样，这里用到了同态加密。Prover对每一个Spend description和Output description都取得一个随机数$rcv$并连同value $v$一起相加后加密为$cv$。
 
 ![bsk](https://i.imgtg.com/2022/12/22/HEGPP.png)
 

@@ -322,7 +322,8 @@ impl ValueCommitment {
     /// Defined in [Zcash Protocol Spec § 5.4.8.3: Homomorphic Pedersen commitments (Sapling and Orchard)][concretehomomorphiccommit].
     ///
     /// [concretehomomorphiccommit]: https://zips.z.cash/protocol/protocol.pdf#concretehomomorphiccommit
-    /// 假定G和H是两个提前初始化的生成元，则数值承诺Comm = k * G + r * H
+    /// 假定G和H是两个提前初始化的生成元，则数值承诺Comm(k, r) = k * G + r * H
+    /// 而其具有的加法同态性使得Comm(k1, r1) + Comm(k2, r2) = (k1 + k2) * G + (r1 + r2) * H = Comm(k1 + k2, r1 + r2)
     pub fn derive(value: NoteValue, rcv: ValueCommitTrapdoor) -> Self {
         let cv = (VALUE_COMMITMENT_VALUE_GENERATOR * jubjub::Scalar::from(value.0))
             + (VALUE_COMMITMENT_RANDOMNESS_GENERATOR * rcv.0);
@@ -1130,7 +1131,7 @@ pub struct MontgomeryPoint {
 
 Jubjub是基于BLS12-381和上述方程的一条扭曲爱德华椭圆曲线（Twisted Edwards Curve），曲线上的点即为`EdwardsPoint`。该种曲线上的加法运算可以避免复杂的边缘情况，从而在电路中进行快速的计算。此外，每一条扭曲爱德华椭圆曲线都和另外某一条蒙哥马利曲线（Montgomery Curve）存在双向有理映射，也就是对于一个有效的`EdwardsPoint`，在对应的蒙哥马利曲线上可以转换得到一个有效的`MontgomeryPoint`。后者被用于Zcash的pedersen hash计算。
 
-我们简单看一下`EdwardsPoint`包含的电路运算，
+我们先看一下`EdwardsPoint`包含的电路运算，
 
 ```rust
 impl EdwardsPoint {
@@ -1549,7 +1550,8 @@ where
     // Represents the result of the multiplication
     let mut result = None;
 
-    // 将by切成3个子数组，用不同的window计算后再合并
+    // 以3为固定长度将by切成子数组，最后一个切割的子数组长度可能不足3
+    // 用不同的window计算后再合并，window的生成看后面
     for (i, (chunk, window)) in by.chunks(3).zip(base.iter()).enumerate() {
         let chunk_a = chunk
             .get(0)
@@ -1589,7 +1591,7 @@ where
 }
 ```
 
-关于[`FixedGenerator`](https://github.com/zcash/librustzcash/blob/3b283ca4451d4f1eeae8f7ceff1c659a01db8efe/zcash_proofs/src/constants.rs#L70)，它来源于某个固定生成元`gen`，不论形式为`SubgroupPoint`还是`ExtendedPoint`，都包含`u`、`v`两个坐标值，
+关于`base`这个[`FixedGenerator`](https://github.com/zcash/librustzcash/blob/3b283ca4451d4f1eeae8f7ceff1c659a01db8efe/zcash_proofs/src/constants.rs#L70)，它来源于某个固定生成元`gen`，不论形式为`SubgroupPoint`还是`ExtendedPoint`，都包含`u`、`v`两个坐标值，而返回的`windows`则是一组坐标的向量，
 
 ```rust
 /// Creates the 3-bit window table `[0, 1, ..., 8]` for different magnitudes of a fixed
@@ -1612,11 +1614,12 @@ pub fn generate_circuit_generator(mut gen: jubjub::SubgroupPoint) -> FixedGenera
         gen = g;
     }
 
+    // 84 * 8
     windows
 }
 ```
 
-此外这里还用到了[`lookup3_xy`](https://github.com/zkcrypto/bellman/blob/4c1746c9c22f3537a86e5320b4fd6c2354291616/src/gadgets/lookup.rs#L31)，
+此外这里还用到了[`lookup3_xy`](https://github.com/zkcrypto/bellman/blob/4c1746c9c22f3537a86e5320b4fd6c2354291616/src/gadgets/lookup.rs#L31)，它完成每部分切片的内部计算，
 
 ```rust
 /// Performs a 3-bit window table lookup. `bits` is in
@@ -1633,6 +1636,7 @@ where
     assert_eq!(coords.len(), 8);
 
     // Calculate the index into `coords`
+    // 由前面可知，bits的长度小于等于3
     let i = match (
         bits[0].get_value(),
         bits[1].get_value(),
@@ -1654,6 +1658,7 @@ where
         _ => None,
     };
 
+    // 以i值确定返回值的长度
     // Allocate the x-coordinate resulting from the lookup
     let res_x = AllocatedNum::alloc(cs.namespace(|| "x"), || Ok(coords[*i.get()?].0))?;
 
@@ -1661,6 +1666,7 @@ where
     let res_y = AllocatedNum::alloc(cs.namespace(|| "y"), || Ok(coords[*i.get()?].1))?;
 
     // Compute the coefficients for the lookup constraints
+    // 先装载window，然后分x、y完成计算
     let mut x_coeffs = [Scalar::zero(); 8];
     let mut y_coeffs = [Scalar::zero(); 8];
     synth::<Scalar, _>(3, coords.iter().map(|c| &c.0), &mut x_coeffs);
@@ -1673,36 +1679,36 @@ where
     cs.enforce(
         || "x-coordinate lookup",
         |lc| {
-            lc + (x_coeffs[0b001], one)
-                + &bits[1].lc::<Scalar>(one, x_coeffs[0b011])
-                + &bits[2].lc::<Scalar>(one, x_coeffs[0b101])
-                + &precomp.lc::<Scalar>(one, x_coeffs[0b111])
+            lc + (x_coeffs[0b001], one)     // x_coeffs[1]
+                + &bits[1].lc::<Scalar>(one, x_coeffs[0b011])   // 3
+                + &bits[2].lc::<Scalar>(one, x_coeffs[0b101])   // 5
+                + &precomp.lc::<Scalar>(one, x_coeffs[0b111])   // 7
         },
         |lc| lc + &bits[0].lc::<Scalar>(one, Scalar::one()),
         |lc| {
             lc + res_x.get_variable()
-                - (x_coeffs[0b000], one)
-                - &bits[1].lc::<Scalar>(one, x_coeffs[0b010])
-                - &bits[2].lc::<Scalar>(one, x_coeffs[0b100])
-                - &precomp.lc::<Scalar>(one, x_coeffs[0b110])
+                - (x_coeffs[0b000], one)    // x_coeffs[0]
+                - &bits[1].lc::<Scalar>(one, x_coeffs[0b010])   // 2
+                - &bits[2].lc::<Scalar>(one, x_coeffs[0b100])   // 4
+                - &precomp.lc::<Scalar>(one, x_coeffs[0b110])   // 6
         },
     );
 
     cs.enforce(
         || "y-coordinate lookup",
         |lc| {
-            lc + (y_coeffs[0b001], one)
-                + &bits[1].lc::<Scalar>(one, y_coeffs[0b011])
-                + &bits[2].lc::<Scalar>(one, y_coeffs[0b101])
-                + &precomp.lc::<Scalar>(one, y_coeffs[0b111])
+            lc + (y_coeffs[0b001], one)     // y_coeffs[1]
+                + &bits[1].lc::<Scalar>(one, y_coeffs[0b011])   // 3
+                + &bits[2].lc::<Scalar>(one, y_coeffs[0b101])   // 5
+                + &precomp.lc::<Scalar>(one, y_coeffs[0b111])   // 7
         },
         |lc| lc + &bits[0].lc::<Scalar>(one, Scalar::one()),
         |lc| {
             lc + res_y.get_variable()
-                - (y_coeffs[0b000], one)
-                - &bits[1].lc::<Scalar>(one, y_coeffs[0b010])
-                - &bits[2].lc::<Scalar>(one, y_coeffs[0b100])
-                - &precomp.lc::<Scalar>(one, y_coeffs[0b110])
+                - (y_coeffs[0b000], one)    // y_coeffs[0]
+                - &bits[1].lc::<Scalar>(one, y_coeffs[0b010])   // 2
+                - &bits[2].lc::<Scalar>(one, y_coeffs[0b100])   // 4
+                - &precomp.lc::<Scalar>(one, y_coeffs[0b110])   // 6
         },
     );
 
@@ -1712,8 +1718,775 @@ where
 
 #### Pedersen Hash
 
+我们最初提到Pedersen Hash是因为Sapling针对value和rcv生成value commitment，但是这一步在进入电路前就完成了，value commitment成为了电路了参数。然而在电路中这一哈希又计算了三次，其中两次分别计算了Spend和Output的note commitment，也就是`value_commitment + g_d + pk_d`的哈希，
+
+```rust
+// Compute the hash of the note contents
+let mut cm = pedersen_hash::pedersen_hash(
+    cs.namespace(|| "note content hash"),
+    pedersen_hash::Personalization::NoteCommitment,
+    &note_contents,
+)?;
+```
+
+另一次计算了Spend中的subtree，
+
+```rust
+// Compute the new subtree value
+cur = pedersen_hash::pedersen_hash(
+    cs.namespace(|| "computation of pedersen hash"),
+    pedersen_hash::Personalization::MerkleTree(i),
+    &preimage,
+)?
+.get_u()
+.clone(); // Injective encoding
+```
+
+所以Sapling的电路仍然计算了Pedersen Hash，我们先看[电路外](https://github.com/zcash/librustzcash/blob/73d9395c9d3c5fa81fc7becd363a2c1a51772a76/zcash_primitives/src/sapling/pedersen_hash.rs)的Pedersen Hash计算，
+
+```rust
+// 输入载荷是note commitment或者merkle tree
+pub enum Personalization {
+    NoteCommitment,
+    MerkleTree(usize),
+}
+
+impl Personalization {
+    pub fn get_bits(&self) -> Vec<bool> {
+        match *self {
+            Personalization::NoteCommitment => vec![true, true, true, true, true, true],
+            Personalization::MerkleTree(num) => {
+                assert!(num < 63);  // 63是Sapling的最高树高度
+
+                (0..6).map(|i| (num >> i) & 1 == 1).collect()
+            }
+        }
+    }
+}
+
+pub fn pedersen_hash<I>(personalization: Personalization, bits: I) -> jubjub::SubgroupPoint
+where
+    I: IntoIterator<Item = bool>,
+{
+    let mut bits = personalization
+        .get_bits()
+        .into_iter()
+        .chain(bits.into_iter());
+
+    let mut result = jubjub::SubgroupPoint::identity();
+    /// 会调用到PEDERSEN_HASH_EXP_TABLE的生成
+    /// Creates the exp table for the Pedersen hash generators.
+    // fn generate_pedersen_hash_exp_table() -> Vec<Vec<Vec<SubgroupPoint>>> {
+    //     /// pub const PEDERSEN_HASH_EXP_WINDOW_SIZE: u32 = 8;
+    //     let window = PEDERSEN_HASH_EXP_WINDOW_SIZE;
+    //
+    //     PEDERSEN_HASH_GENERATORS
+    //         .iter()
+    //         .cloned()
+    //         .map(|mut g| {
+    //             let mut tables = vec![];
+    //
+    //             let mut num_bits = 0;
+    //             while num_bits <= jubjub::Fr::NUM_BITS {
+    //                 let mut table = Vec::with_capacity(1 << window);
+    //                 let mut base = SubgroupPoint::identity();
+    //
+    //                 for _ in 0..(1 << window) {
+    //                     table.push(base);
+    //                     base += g;
+    //                 }
+    //
+    //                 tables.push(table);
+    //                 num_bits += window;
+    //
+    //                 for _ in 0..window {
+    //                     g = g.double();
+    //                 }
+    //             }
+    //
+    //             tables
+    //         })
+    //         .collect()
+    // }
+    let mut generators = PEDERSEN_HASH_EXP_TABLE.iter();
+
+    loop {
+        let mut acc = jubjub::Fr::zero();
+        let mut cur = jubjub::Fr::one();
+        /// The maximum number of chunks per segment of the Pedersen hash.
+        /// pub const PEDERSEN_HASH_CHUNKS_PER_GENERATOR: usize = 63;
+        let mut chunks_remaining = PEDERSEN_HASH_CHUNKS_PER_GENERATOR;
+        let mut encountered_bits = false;
+
+        // Grab three bits from the input
+        // 同样是以3为固定长度，分段计算
+        while let Some(a) = bits.next() {
+            encountered_bits = true;
+
+            let b = bits.next().unwrap_or(false);
+            let c = bits.next().unwrap_or(false);
+
+            // Start computing this portion of the scalar
+            let mut tmp = cur;
+            if a {
+                tmp.add_assign(&cur);
+            }
+            cur = cur.double(); // 2^1 * cur
+            if b {
+                tmp.add_assign(&cur);
+            }
+
+            // conditionally negate
+            if c {
+                tmp = tmp.neg();
+            }
+
+            acc.add_assign(&tmp);
+
+            chunks_remaining -= 1;
+
+            if chunks_remaining == 0 {
+                break;
+            } else {
+                cur = cur.double().double().double(); // 2^4 * cur
+            }
+        }
+
+        if !encountered_bits {
+            break;
+        }
+
+        let mut table: &[Vec<jubjub::SubgroupPoint>] =
+            generators.next().expect("we don't have enough generators");
+        /// pub const PEDERSEN_HASH_EXP_WINDOW_SIZE: u32 = 8;
+        let window = PEDERSEN_HASH_EXP_WINDOW_SIZE as usize;
+        let window_mask = (1u64 << window) - 1;
+
+        let acc = acc.to_repr();
+        let num_limbs: usize = acc.as_ref().len() / 8;
+        let mut limbs = vec![0u64; num_limbs + 1];
+        LittleEndian::read_u64_into(acc.as_ref(), &mut limbs[..num_limbs]);
+
+        let mut tmp = jubjub::SubgroupPoint::identity();
+
+        let mut pos = 0;
+        while pos < jubjub::Fr::NUM_BITS as usize {
+            let u64_idx = pos / 64;
+            let bit_idx = pos % 64;
+            let i = (if bit_idx + window < 64 {
+                // This window's bits are contained in a single u64.
+                limbs[u64_idx] >> bit_idx
+            } else {
+                // Combine the current u64's bits with the bits from the next u64.
+                (limbs[u64_idx] >> bit_idx) | (limbs[u64_idx + 1] << (64 - bit_idx))
+            } & window_mask) as usize;
+
+            tmp += table[0][i];
+
+            pos += window;
+            table = &table[1..];
+        }
+
+        result += tmp;
+    }
+
+    result
+}
+```
+
+再看[电路内](https://github.com/zcash/librustzcash/blob/620ff21005017f625c4b5720561b76cb62048628/zcash_proofs/src/circuit/pedersen_hash.rs)的Pedersen Hash计算，
+
+```rust
+fn get_constant_bools(person: &Personalization) -> Vec<Boolean> {
+    person
+        .get_bits()
+        .into_iter()
+        .map(Boolean::constant)
+        .collect()
+}
+
+pub fn pedersen_hash<CS>(
+    mut cs: CS,
+    personalization: Personalization,
+    bits: &[Boolean],
+) -> Result<EdwardsPoint, SynthesisError>
+where
+    CS: ConstraintSystem<bls12_381::Scalar>,
+{
+    let personalization = get_constant_bools(&personalization);
+    assert_eq!(personalization.len(), 6);
+
+    let mut edwards_result = None;
+    let mut bits = personalization.iter().chain(bits.iter()).peekable();
+    let mut segment_generators = PEDERSEN_CIRCUIT_GENERATORS.iter();
+    let boolean_false = Boolean::constant(false);
+
+    let mut segment_i = 0;
+    while bits.peek().is_some() {
+        let mut segment_result = None;
+        let mut segment_windows = &segment_generators.next().expect("enough segments")[..];
+
+        let mut window_i = 0;
+        // 同样是以3为固定长度，分段计算
+        while let Some(a) = bits.next() {
+            let b = bits.next().unwrap_or(&boolean_false);
+            let c = bits.next().unwrap_or(&boolean_false);
+
+            let tmp = lookup3_xy_with_conditional_negation(
+                cs.namespace(|| format!("segment {}, window {}", segment_i, window_i)),
+                &[a.clone(), b.clone(), c.clone()],
+                &segment_windows[0],
+            )?;
+
+            // 转换到MontgomeryPoint
+            let tmp = MontgomeryPoint::interpret_unchecked(tmp.0, tmp.1);
+
+            match segment_result {
+                None => {
+                    segment_result = Some(tmp);
+                }
+                Some(ref mut segment_result) => {
+                    *segment_result = tmp.add(
+                        cs.namespace(|| {
+                            format!("addition of segment {}, window {}", segment_i, window_i)
+                        }),
+                        segment_result,
+                    )?;
+                }
+            }
+
+            segment_windows = &segment_windows[1..];
+
+            if segment_windows.is_empty() {
+                break;
+            }
+
+            window_i += 1;
+        }
+
+        let segment_result = segment_result.expect(
+            "bits is not exhausted due to while condition;
+                    thus there must be a segment window;
+                    thus there must be a segment result",
+        );
+
+        // Convert this segment into twisted Edwards form.
+        // 转换回EdwardsPoint
+        let segment_result = segment_result.into_edwards(
+            cs.namespace(|| format!("conversion of segment {} into edwards", segment_i)),
+        )?;
+
+        match edwards_result {
+            Some(ref mut edwards_result) => {
+                *edwards_result = segment_result.add(
+                    cs.namespace(|| format!("addition of segment {} to accumulator", segment_i)),
+                    edwards_result,
+                )?;
+            }
+            None => {
+                edwards_result = Some(segment_result);
+            }
+        }
+
+        segment_i += 1;
+    }
+
+    Ok(edwards_result.unwrap())
+}
+```
+
+这里使用到了[`lookup3_xy_with_conditional_negation`](https://github.com/zkcrypto/bellman/blob/4c1746c9c22f3537a86e5320b4fd6c2354291616/src/gadgets/lookup.rs#L121)，
+
+```rust
+/// Performs a 3-bit window table lookup, where
+/// one of the bits is a sign bit.
+pub fn lookup3_xy_with_conditional_negation<Scalar: PrimeField, CS>(
+    mut cs: CS,
+    bits: &[Boolean],
+    coords: &[(Scalar, Scalar)],
+) -> Result<(Num<Scalar>, Num<Scalar>), SynthesisError>
+where
+    CS: ConstraintSystem<Scalar>,
+{
+    assert_eq!(bits.len(), 3);
+    assert_eq!(coords.len(), 4);
+
+    // Calculate the index into `coords`
+    let i = match (bits[0].get_value(), bits[1].get_value()) {
+        (Some(a_value), Some(b_value)) => {
+            let mut tmp = 0;
+            if a_value {
+                tmp += 1;
+            }
+            if b_value {
+                tmp += 2;
+            }
+            Some(tmp)
+        }
+        _ => None,
+    };
+
+    // Allocate the y-coordinate resulting from the lookup
+    // and conditional negation
+    let y = AllocatedNum::alloc(cs.namespace(|| "y"), || {
+        let mut tmp = coords[*i.get()?].1;
+        if *bits[2].get_value().get()? {
+            tmp = tmp.neg();
+        }
+        Ok(tmp)
+    })?;
+
+    let one = CS::one();
+
+    // Compute the coefficients for the lookup constraints
+    let mut x_coeffs = [Scalar::zero(); 4];
+    let mut y_coeffs = [Scalar::zero(); 4];
+    synth::<Scalar, _>(2, coords.iter().map(|c| &c.0), &mut x_coeffs);
+    synth::<Scalar, _>(2, coords.iter().map(|c| &c.1), &mut y_coeffs);
+
+    let precomp = Boolean::and(cs.namespace(|| "precomp"), &bits[0], &bits[1])?;
+
+    let x = Num::zero()
+        .add_bool_with_coeff(one, &Boolean::constant(true), x_coeffs[0b00])
+        .add_bool_with_coeff(one, &bits[0], x_coeffs[0b01])
+        .add_bool_with_coeff(one, &bits[1], x_coeffs[0b10])
+        .add_bool_with_coeff(one, &precomp, x_coeffs[0b11]);
+
+    let y_lc = precomp.lc::<Scalar>(one, y_coeffs[0b11])
+        + &bits[1].lc::<Scalar>(one, y_coeffs[0b10])
+        + &bits[0].lc::<Scalar>(one, y_coeffs[0b01])
+        + (y_coeffs[0b00], one);
+
+    cs.enforce(
+        || "y-coordinate lookup",
+        |lc| lc + &y_lc + &y_lc,
+        |lc| lc + &bits[2].lc::<Scalar>(one, Scalar::one()),
+        |lc| lc + &y_lc - y.get_variable(),
+    );
+
+    Ok((x, y.into()))
+}
+```
+
 #### Blake2s
+
+我们可以在[zkcrypto/bellman/src/gadgets/blake2s.rs](https://github.com/zkcrypto/bellman/blob/9738f45d1dcd7a76428702e82ec7c5aeac5e2041/src/gadgets/blake2s.rs)找到完整实现，
+
+```rust
+//! The [BLAKE2s] hash function with personalization support.
+//!
+//! [BLAKE2s]: https://tools.ietf.org/html/rfc7693
+
+use super::{boolean::Boolean, multieq::MultiEq, uint32::UInt32};
+use crate::{ConstraintSystem, SynthesisError};
+use ff::PrimeField;
+
+/*
+2.1.  Parameters
+   The following table summarizes various parameters and their ranges:
+                            | BLAKE2b          | BLAKE2s          |
+              --------------+------------------+------------------+
+               Bits in word | w = 64           | w = 32           |
+               Rounds in F  | r = 12           | r = 10           |
+               Block bytes  | bb = 128         | bb = 64          |
+               Hash bytes   | 1 <= nn <= 64    | 1 <= nn <= 32    |
+               Key bytes    | 0 <= kk <= 64    | 0 <= kk <= 32    |
+               Input bytes  | 0 <= ll < 2**128 | 0 <= ll < 2**64  |
+              --------------+------------------+------------------+
+               G Rotation   | (R1, R2, R3, R4) | (R1, R2, R3, R4) |
+                constants = | (32, 24, 16, 63) | (16, 12,  8,  7) |
+              --------------+------------------+------------------+
+*/
+
+const R1: usize = 16;
+const R2: usize = 12;
+const R3: usize = 8;
+const R4: usize = 7;
+
+/*
+          Round   |  0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 |
+        ----------+-------------------------------------------------+
+         SIGMA[0] |  0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 |
+         SIGMA[1] | 14 10  4  8  9 15 13  6  1 12  0  2 11  7  5  3 |
+         SIGMA[2] | 11  8 12  0  5  2 15 13 10 14  3  6  7  1  9  4 |
+         SIGMA[3] |  7  9  3  1 13 12 11 14  2  6  5 10  4  0 15  8 |
+         SIGMA[4] |  9  0  5  7  2  4 10 15 14  1 11 12  6  8  3 13 |
+         SIGMA[5] |  2 12  6 10  0 11  8  3  4 13  7  5 15 14  1  9 |
+         SIGMA[6] | 12  5  1 15 14 13  4 10  0  7  6  3  9  2  8 11 |
+         SIGMA[7] | 13 11  7 14 12  1  3  9  5  0 15  4  8  6  2 10 |
+         SIGMA[8] |  6 15 14  9 11  3  0  8 12  2 13  7  1  4 10  5 |
+         SIGMA[9] | 10  2  8  4  7  6  1  5 15 11  9 14  3 12 13  0 |
+        ----------+-------------------------------------------------+
+*/
+
+const SIGMA: [[usize; 16]; 10] = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+    [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
+    [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
+    [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],
+    [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
+    [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],
+    [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
+    [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],
+    [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
+];
+
+/*
+3.1.  Mixing Function G
+   The G primitive function mixes two input words, "x" and "y", into
+   four words indexed by "a", "b", "c", and "d" in the working vector
+   v[0..15].  The full modified vector is returned.  The rotation
+   constants (R1, R2, R3, R4) are given in Section 2.1.
+       FUNCTION G( v[0..15], a, b, c, d, x, y )
+       |
+       |   v[a] := (v[a] + v[b] + x) mod 2**w
+       |   v[d] := (v[d] ^ v[a]) >>> R1
+       |   v[c] := (v[c] + v[d])     mod 2**w
+       |   v[b] := (v[b] ^ v[c]) >>> R2
+       |   v[a] := (v[a] + v[b] + y) mod 2**w
+       |   v[d] := (v[d] ^ v[a]) >>> R3
+       |   v[c] := (v[c] + v[d])     mod 2**w
+       |   v[b] := (v[b] ^ v[c]) >>> R4
+       |
+       |   RETURN v[0..15]
+       |
+       END FUNCTION.
+*/
+
+fn mixing_g<Scalar: PrimeField, CS: ConstraintSystem<Scalar>, M>(
+    mut cs: M,
+    v: &mut [UInt32],
+    a: usize,
+    b: usize,
+    c: usize,
+    d: usize,
+    x: &UInt32,
+    y: &UInt32,
+) -> Result<(), SynthesisError>
+where
+    M: ConstraintSystem<Scalar, Root = MultiEq<Scalar, CS>>,
+{
+    v[a] = UInt32::addmany(
+        cs.namespace(|| "mixing step 1"),
+        &[v[a].clone(), v[b].clone(), x.clone()],
+    )?;
+    v[d] = v[d].xor(cs.namespace(|| "mixing step 2"), &v[a])?.rotr(R1);
+    v[c] = UInt32::addmany(
+        cs.namespace(|| "mixing step 3"),
+        &[v[c].clone(), v[d].clone()],
+    )?;
+    v[b] = v[b].xor(cs.namespace(|| "mixing step 4"), &v[c])?.rotr(R2);
+    v[a] = UInt32::addmany(
+        cs.namespace(|| "mixing step 5"),
+        &[v[a].clone(), v[b].clone(), y.clone()],
+    )?;
+    v[d] = v[d].xor(cs.namespace(|| "mixing step 6"), &v[a])?.rotr(R3);
+    v[c] = UInt32::addmany(
+        cs.namespace(|| "mixing step 7"),
+        &[v[c].clone(), v[d].clone()],
+    )?;
+    v[b] = v[b].xor(cs.namespace(|| "mixing step 8"), &v[c])?.rotr(R4);
+
+    Ok(())
+}
+
+/*
+3.2.  Compression Function F
+   Compression function F takes as an argument the state vector "h",
+   message block vector "m" (last block is padded with zeros to full
+   block size, if required), 2w-bit offset counter "t", and final block
+   indicator flag "f".  Local vector v[0..15] is used in processing.  F
+   returns a new state vector.  The number of rounds, "r", is 12 for
+   BLAKE2b and 10 for BLAKE2s.  Rounds are numbered from 0 to r - 1.
+       FUNCTION F( h[0..7], m[0..15], t, f )
+       |
+       |      // Initialize local work vector v[0..15]
+       |      v[0..7] := h[0..7]              // First half from state.
+       |      v[8..15] := IV[0..7]            // Second half from IV.
+       |
+       |      v[12] := v[12] ^ (t mod 2**w)   // Low word of the offset.
+       |      v[13] := v[13] ^ (t >> w)       // High word.
+       |
+       |      IF f = TRUE THEN                // last block flag?
+       |      |   v[14] := v[14] ^ 0xFF..FF   // Invert all bits.
+       |      END IF.
+       |
+       |      // Cryptographic mixing
+       |      FOR i = 0 TO r - 1 DO           // Ten or twelve rounds.
+       |      |
+       |      |   // Message word selection permutation for this round.
+       |      |   s[0..15] := SIGMA[i mod 10][0..15]
+       |      |
+       |      |   v := G( v, 0, 4,  8, 12, m[s[ 0]], m[s[ 1]] )
+       |      |   v := G( v, 1, 5,  9, 13, m[s[ 2]], m[s[ 3]] )
+       |      |   v := G( v, 2, 6, 10, 14, m[s[ 4]], m[s[ 5]] )
+       |      |   v := G( v, 3, 7, 11, 15, m[s[ 6]], m[s[ 7]] )
+       |      |
+       |      |   v := G( v, 0, 5, 10, 15, m[s[ 8]], m[s[ 9]] )
+       |      |   v := G( v, 1, 6, 11, 12, m[s[10]], m[s[11]] )
+       |      |   v := G( v, 2, 7,  8, 13, m[s[12]], m[s[13]] )
+       |      |   v := G( v, 3, 4,  9, 14, m[s[14]], m[s[15]] )
+       |      |
+       |      END FOR
+       |
+       |      FOR i = 0 TO 7 DO               // XOR the two halves.
+       |      |   h[i] := h[i] ^ v[i] ^ v[i + 8]
+       |      END FOR.
+       |
+       |      RETURN h[0..7]                  // New state.
+       |
+       END FUNCTION.
+*/
+
+fn blake2s_compression<Scalar: PrimeField, CS: ConstraintSystem<Scalar>>(
+    mut cs: CS,
+    h: &mut [UInt32],
+    m: &[UInt32],
+    t: u64,
+    f: bool,
+) -> Result<(), SynthesisError> {
+    assert_eq!(h.len(), 8);
+    assert_eq!(m.len(), 16);
+
+    /*
+    static const uint32_t blake2s_iv[8] =
+    {
+        0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+        0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19
+    };
+    */
+
+    let mut v = Vec::with_capacity(16);
+    v.extend_from_slice(h);
+    v.push(UInt32::constant(0x6A09E667));
+    v.push(UInt32::constant(0xBB67AE85));
+    v.push(UInt32::constant(0x3C6EF372));
+    v.push(UInt32::constant(0xA54FF53A));
+    v.push(UInt32::constant(0x510E527F));
+    v.push(UInt32::constant(0x9B05688C));
+    v.push(UInt32::constant(0x1F83D9AB));
+    v.push(UInt32::constant(0x5BE0CD19));
+
+    assert_eq!(v.len(), 16);
+
+    v[12] = v[12].xor(cs.namespace(|| "first xor"), &UInt32::constant(t as u32))?;
+    v[13] = v[13].xor(
+        cs.namespace(|| "second xor"),
+        &UInt32::constant((t >> 32) as u32),
+    )?;
+
+    if f {
+        v[14] = v[14].xor(
+            cs.namespace(|| "third xor"),
+            &UInt32::constant(u32::max_value()),
+        )?;
+    }
+
+    {
+        let mut cs = MultiEq::new(&mut cs);
+
+        for i in 0..10 {
+            let mut cs = cs.namespace(|| format!("round {}", i));
+
+            let s = SIGMA[i % 10];
+
+            mixing_g(
+                cs.namespace(|| "mixing invocation 1"),
+                &mut v,
+                0,
+                4,
+                8,
+                12,
+                &m[s[0]],
+                &m[s[1]],
+            )?;
+            mixing_g(
+                cs.namespace(|| "mixing invocation 2"),
+                &mut v,
+                1,
+                5,
+                9,
+                13,
+                &m[s[2]],
+                &m[s[3]],
+            )?;
+            mixing_g(
+                cs.namespace(|| "mixing invocation 3"),
+                &mut v,
+                2,
+                6,
+                10,
+                14,
+                &m[s[4]],
+                &m[s[5]],
+            )?;
+            mixing_g(
+                cs.namespace(|| "mixing invocation 4"),
+                &mut v,
+                3,
+                7,
+                11,
+                15,
+                &m[s[6]],
+                &m[s[7]],
+            )?;
+
+            mixing_g(
+                cs.namespace(|| "mixing invocation 5"),
+                &mut v,
+                0,
+                5,
+                10,
+                15,
+                &m[s[8]],
+                &m[s[9]],
+            )?;
+            mixing_g(
+                cs.namespace(|| "mixing invocation 6"),
+                &mut v,
+                1,
+                6,
+                11,
+                12,
+                &m[s[10]],
+                &m[s[11]],
+            )?;
+            mixing_g(
+                cs.namespace(|| "mixing invocation 7"),
+                &mut v,
+                2,
+                7,
+                8,
+                13,
+                &m[s[12]],
+                &m[s[13]],
+            )?;
+            mixing_g(
+                cs.namespace(|| "mixing invocation 8"),
+                &mut v,
+                3,
+                4,
+                9,
+                14,
+                &m[s[14]],
+                &m[s[15]],
+            )?;
+        }
+    }
+
+    for i in 0..8 {
+        let mut cs = cs.namespace(|| format!("h[{i}] ^ v[{i}] ^ v[{i} + 8]", i = i));
+
+        h[i] = h[i].xor(cs.namespace(|| "first xor"), &v[i])?;
+        h[i] = h[i].xor(cs.namespace(|| "second xor"), &v[i + 8])?;
+    }
+
+    Ok(())
+}
+
+/*
+        FUNCTION BLAKE2( d[0..dd-1], ll, kk, nn )
+        |
+        |     h[0..7] := IV[0..7]          // Initialization Vector.
+        |
+        |     // Parameter block p[0]
+        |     h[0] := h[0] ^ 0x01010000 ^ (kk << 8) ^ nn
+        |
+        |     // Process padded key and data blocks
+        |     IF dd > 1 THEN
+        |     |       FOR i = 0 TO dd - 2 DO
+        |     |       |       h := F( h, d[i], (i + 1) * bb, FALSE )
+        |     |       END FOR.
+        |     END IF.
+        |
+        |     // Final block.
+        |     IF kk = 0 THEN
+        |     |       h := F( h, d[dd - 1], ll, TRUE )
+        |     ELSE
+        |     |       h := F( h, d[dd - 1], ll + bb, TRUE )
+        |     END IF.
+        |
+        |     RETURN first "nn" bytes from little-endian word array h[].
+        |
+        END FUNCTION.
+*/
+
+pub fn blake2s<Scalar: PrimeField, CS: ConstraintSystem<Scalar>>(
+    mut cs: CS,
+    input: &[Boolean],
+    personalization: &[u8],
+) -> Result<Vec<Boolean>, SynthesisError> {
+    use byteorder::{ByteOrder, LittleEndian};
+
+    assert_eq!(personalization.len(), 8);
+    assert!(input.len() % 8 == 0);
+
+    let mut h = Vec::with_capacity(8);
+    h.push(UInt32::constant(0x6A09E667 ^ 0x01010000 ^ 32));
+    h.push(UInt32::constant(0xBB67AE85));
+    h.push(UInt32::constant(0x3C6EF372));
+    h.push(UInt32::constant(0xA54FF53A));
+    h.push(UInt32::constant(0x510E527F));
+    h.push(UInt32::constant(0x9B05688C));
+
+    // Personalization is stored here
+    h.push(UInt32::constant(
+        0x1F83D9AB ^ LittleEndian::read_u32(&personalization[0..4]),
+    ));
+    h.push(UInt32::constant(
+        0x5BE0CD19 ^ LittleEndian::read_u32(&personalization[4..8]),
+    ));
+
+    let mut blocks: Vec<Vec<UInt32>> = vec![];
+
+    for block in input.chunks(512) {
+        let mut this_block = Vec::with_capacity(16);
+        for word in block.chunks(32) {
+            let mut tmp = word.to_vec();
+            while tmp.len() < 32 {
+                tmp.push(Boolean::constant(false));
+            }
+            this_block.push(UInt32::from_bits(&tmp));
+        }
+        while this_block.len() < 16 {
+            this_block.push(UInt32::constant(0));
+        }
+        blocks.push(this_block);
+    }
+
+    if blocks.is_empty() {
+        blocks.push((0..16).map(|_| UInt32::constant(0)).collect());
+    }
+
+    for (i, block) in blocks[0..blocks.len() - 1].iter().enumerate() {
+        let cs = cs.namespace(|| format!("block {}", i));
+
+        blake2s_compression(cs, &mut h, block, ((i as u64) + 1) * 64, false)?;
+    }
+
+    {
+        let cs = cs.namespace(|| "final block");
+
+        blake2s_compression(
+            cs,
+            &mut h,
+            &blocks[blocks.len() - 1],
+            (input.len() / 8) as u64,
+            true,
+        )?;
+    }
+
+    Ok(h.into_iter().flat_map(|b| b.into_bits()).collect())
+}
+```
 
 ### Bellman计算
 
-Sapling后面调用bellman生成证明时，同样使用了`create_random_proof`，因此过程和之前一样，以及使用了相同的`ProvingAssignment`，不再赘述。
+Sapling后面调用bellman生成证明时，使用了同样的`create_random_proof`入口，因此后面发生的事情和Sprout一样，不再赘述。如有需要可以回看上一部分。
+
+## 交易构建
+
+## Sapling验证
+
+## 小结

@@ -1392,39 +1392,7 @@ public:
     typedef std::array<unsigned char, 64> joinsplit_sig_t;
     typedef std::array<unsigned char, 64> binding_sig_t;
 
-    // Transactions that include a list of JoinSplits are >= version 2.
-    static const int32_t SPROUT_MIN_CURRENT_VERSION = 1;
-    static const int32_t SPROUT_MAX_CURRENT_VERSION = 2;
-    static const int32_t OVERWINTER_MIN_CURRENT_VERSION = 3;
-    static const int32_t OVERWINTER_MAX_CURRENT_VERSION = 3;
-    static const int32_t SAPLING_MIN_CURRENT_VERSION = 4;
-    static const int32_t SAPLING_MAX_CURRENT_VERSION = 4;
-    static const int32_t NU5_MIN_CURRENT_VERSION = 4;
-    static const int32_t NU5_MAX_CURRENT_VERSION = 5;
-
-    static_assert(SPROUT_MIN_CURRENT_VERSION >= SPROUT_MIN_TX_VERSION,
-                  "standard rule for tx version should be consistent with network rule");
-
-    static_assert(OVERWINTER_MIN_CURRENT_VERSION >= OVERWINTER_MIN_TX_VERSION,
-                  "standard rule for tx version should be consistent with network rule");
-
-    static_assert( (OVERWINTER_MAX_CURRENT_VERSION <= OVERWINTER_MAX_TX_VERSION &&
-                    OVERWINTER_MAX_CURRENT_VERSION >= OVERWINTER_MIN_CURRENT_VERSION),
-                  "standard rule for tx version should be consistent with network rule");
-
-    static_assert(SAPLING_MIN_CURRENT_VERSION >= SAPLING_MIN_TX_VERSION,
-                  "standard rule for tx version should be consistent with network rule");
-
-    static_assert( (SAPLING_MAX_CURRENT_VERSION <= SAPLING_MAX_TX_VERSION &&
-                    SAPLING_MAX_CURRENT_VERSION >= SAPLING_MIN_CURRENT_VERSION),
-                  "standard rule for tx version should be consistent with network rule");
-
-    static_assert(NU5_MIN_CURRENT_VERSION >= SAPLING_MIN_TX_VERSION,
-                  "standard rule for tx version should be consistent with network rule");
-
-    static_assert( (NU5_MAX_CURRENT_VERSION <= ZIP225_MAX_TX_VERSION &&
-                    NU5_MAX_CURRENT_VERSION >= NU5_MIN_CURRENT_VERSION),
-                  "standard rule for tx version should be consistent with network rule");
+    // ......
 
     // The local variables are made const to prevent unintended modification
     // without updating the cached hash value. However, CTransaction is not
@@ -1446,6 +1414,7 @@ public:
     // Sprout Tx
     const std::vector<JSDescription> vJoinSplit;
     const Ed25519VerificationKey joinSplitPubKey;
+    // 两个协议分别使用的签名
     const Ed25519Signature joinSplitSig;
     const binding_sig_t bindingSig = {{0}};
 
@@ -1522,15 +1491,15 @@ public:
 
 ### 构建过程
 
-不出意外，和我们在生成证明时候揭露的公共参数基本相同。可惜的是，Sprout协议下构建交易的过程已经被移除，我们只能在历史代码中找到对`ZCJoinSplit`的[使用](https://github.com/zcash/zcash/blob/v3.0.0/src/transaction_builder.cpp#L367)，选取了一部分如下，
+不出意外，和我们在生成证明时候揭露的公共参数基本相同。我们找到构建`CTransaction`的入口[TransactionBuilder::Build()](https://github.com/zcash/zcash/blob/3cec519ce498133e4bc88d59a9b704a3dc3b1977/src/transaction_builder.cpp#L483)，选取了一部分如下，
 
 ```cpp
 //
 // Sprout JoinSplits
 //
 
-unsigned char joinSplitPrivKey[crypto_sign_SECRETKEYBYTES];
-crypto_sign_keypair(mtx.joinSplitPubKey.begin(), joinSplitPrivKey);
+Ed25519SigningKey joinSplitPrivKey;
+ed25519_generate_keypair(&joinSplitPrivKey, &mtx.joinSplitPubKey);
 
 // Create Sprout JSDescriptions
 // 每个JoinSplit只能处理两个input和两个output，所以有时需要构建多个JoinSplit
@@ -1538,47 +1507,26 @@ if (!jsInputs.empty() || !jsOutputs.empty()) {
     try {
         CreateJSDescriptions();
     } catch (JSDescException e) {
-        librustzcash_sapling_proving_ctx_free(ctx);
         return TransactionBuilderResult(e.what());
-    } catch (std::runtime_error e) {
-        librustzcash_sapling_proving_ctx_free(ctx);
-        throw e;
     }
 }
 
 // ......
 
-//
-// Signatures
-//
-auto consensusBranchId = CurrentEpochBranchId(nHeight, consensusParams);
-
-// Empty output script.
-uint256 dataToBeSigned;
-CScript scriptCode;
-try {
-    dataToBeSigned = SignatureHash(scriptCode, mtx, NOT_AN_INPUT, SIGHASH_ALL, 0, consensusBranchId);
-} catch (std::logic_error ex) {
-    librustzcash_sapling_proving_ctx_free(ctx);
-    return TransactionBuilderResult("Could not construct signature hash: " + std::string(ex.what()));
-}
-
-// ......
-
 // Create Sprout joinSplitSig
-if (crypto_sign_detached(
-    mtx.joinSplitSig.data(), NULL,
+if (!ed25519_sign(
+    &joinSplitPrivKey,
     dataToBeSigned.begin(), 32,
-    joinSplitPrivKey) != 0)
+    &mtx.joinSplitSig))
 {
     return TransactionBuilderResult("Failed to create Sprout joinSplitSig");
 }
 
 // Sanity check Sprout joinSplitSig
-if (crypto_sign_verify_detached(
-    mtx.joinSplitSig.data(),
-    dataToBeSigned.begin(), 32,
-    mtx.joinSplitPubKey.begin()) != 0)
+if (!ed25519_verify(
+    &mtx.joinSplitPubKey,
+    &mtx.joinSplitSig,
+    dataToBeSigned.begin(), 32))
 {
     return TransactionBuilderResult("Sprout joinSplitSig sanity check failed");
 }

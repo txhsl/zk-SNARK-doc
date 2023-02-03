@@ -2487,6 +2487,391 @@ Sapling后面调用bellman生成证明时，使用了同样的`create_random_pro
 
 ## 交易构建
 
+### 交易结构
+
+在Sprout的介绍中已经提到过Zcash交易的基本结构，
+
+```cpp
+/** The basic transaction that is broadcasted on the network and contained in
+ * blocks.  A transaction can contain multiple inputs and outputs.
+ */
+class CTransaction
+{
+private:
+    // ......
+protected:
+    // ......
+public:
+    typedef std::array<unsigned char, 64> joinsplit_sig_t;
+    typedef std::array<unsigned char, 64> binding_sig_t;
+
+    // ......
+
+    // The local variables are made const to prevent unintended modification
+    // without updating the cached hash value. However, CTransaction is not
+    // actually immutable; deserialization and assignment are implemented,
+    // and bypass the constness. This is safe, as they update the entire
+    // structure, including the hash.
+    // 公用属性
+    const bool fOverwintered{false};
+    const int32_t nVersion{0};
+    const uint32_t nVersionGroupId{0};
+    // Transparent Tx
+    const std::vector<CTxIn> vin;
+    const std::vector<CTxOut> vout;
+    const uint32_t nLockTime{0};
+    const uint32_t nExpiryHeight{0};
+    // Sapling Tx
+    const std::vector<SpendDescription> vShieldedSpend;
+    const std::vector<OutputDescription> vShieldedOutput;
+    // Sprout Tx
+    const std::vector<JSDescription> vJoinSplit;
+    const Ed25519VerificationKey joinSplitPubKey;
+    // 两个协议分别使用的签名
+    const Ed25519Signature joinSplitSig;
+    const binding_sig_t bindingSig = {{0}};
+
+    /** Construct a CTransaction that qualifies as IsNull() */
+    CTransaction();
+
+    /** Convert a CMutableTransaction into a CTransaction. */
+    CTransaction(const CMutableTransaction &tx);
+    CTransaction(CMutableTransaction &&tx);
+
+    CTransaction& operator=(const CTransaction& tx);
+
+    // ......
+}
+```
+
+先看[SpendDescription](https://github.com/zcash/zcash/blob/e03b964abffac285a066ba496f16cf2cd73cf61c/src/primitives/transaction.h#L99)，
+
+```cpp
+/**
+ * The storage format for Sapling Spend descriptions in v5 transactions.
+ */
+class SpendDescriptionV5
+{
+public:
+    uint256 cv;                    //!< A value commitment to the value of the input note.
+    uint256 nullifier;             //!< The nullifier of the input note.
+    uint256 rk;                    //!< The randomized public key for spendAuthSig.
+
+    // ......
+};
+
+/**
+ * A shielded input to a transaction. It contains data that describes a Spend transfer.
+ */
+class SpendDescription : public SpendDescriptionV5
+{
+public:
+    typedef std::array<unsigned char, 64> spend_auth_sig_t;
+
+    uint256 anchor;                //!< A Merkle root of the Sapling note commitment tree at some block height in the past.
+    libzcash::GrothProof zkproof;  //!< A zero-knowledge proof using the spend circuit.
+    spend_auth_sig_t spendAuthSig; //!< A signature authorizing this spend.
+
+    // ......
+};
+```
+
+再看[OutputDescription](https://github.com/zcash/zcash/blob/e03b964abffac285a066ba496f16cf2cd73cf61c/src/primitives/transaction.h#L177)，
+
+```cpp
+/**
+ * The storage format for Sapling Output descriptions in v5 transactions.
+ */
+class OutputDescriptionV5
+{
+public:
+    uint256 cv;                     //!< A value commitment to the value of the output note.
+    uint256 cmu;                     //!< The u-coordinate of the note commitment for the output note.
+    uint256 ephemeralKey;           //!< A Jubjub public key.
+    libzcash::SaplingEncCiphertext encCiphertext; //!< A ciphertext component for the encrypted output note.
+    libzcash::SaplingOutCiphertext outCiphertext; //!< A ciphertext component for the encrypted output note.
+
+    // ......
+};
+
+/**
+ * A shielded output to a transaction. It contains data that describes an Output transfer.
+ */
+class OutputDescription : public OutputDescriptionV5
+{
+public:
+    libzcash::GrothProof zkproof;   //!< A zero-knowledge proof using the output circuit.
+
+    // ......
+};
+```
+
+在SpendDescription中，Zcash发送了公开参数`cv`、`nullifier`、`rk`和`anchor`，以及我们计算的证明`zkproof`和签名`spendAuthSig`；而在OutputDescription中，Zcash则发送了公开参数`cv`、`cmu`，我们的证明`zkproof`，两个密文`encCiphertext`、`outCiphertext`，以及一个公钥`ephemeralKey`。
+
+我们已经了解了公开参数和证明的由来，接下来的重点将转移到密钥和签名。
+
+### 构建过程
+
+Sapling协议使用和Sprout协议相同的交易构建入口[TransactionBuilder::Build()](https://github.com/zcash/zcash/blob/3cec519ce498133e4bc88d59a9b704a3dc3b1977/src/transaction_builder.cpp#L483)，下面选取一部分，
+
+```cpp
+//
+// Sapling spends and outputs
+//
+
+auto ctx = sapling::init_prover();
+
+// Create Sapling SpendDescriptions
+for (auto spend : spends) {
+    // 调用librustzcash计算commitment
+    auto cm = spend.note.cmu();
+    // 调用librustzcash计算nullifier
+    auto nf = spend.note.nullifier(
+        spend.expsk.full_viewing_key(), spend.witness.position());
+    if (!cm || !nf) {
+        return TransactionBuilderResult("Spend is invalid");
+    }
+
+    // Get subtree
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << spend.witness.path();
+    std::array<unsigned char, 1065> witness;
+    std::move(ss.begin(), ss.end(), witness.begin());
+
+    std::array<unsigned char, 32> cv;
+    std::array<unsigned char, 32> rk;
+    SpendDescription sdesc;
+    // Generate rcm
+    uint256 rcm = spend.note.rcm();
+    // 调用librustzcash计算proof
+    if (!ctx->create_spend_proof(
+            spend.expsk.full_viewing_key().ak.GetRawBytes(),
+            spend.expsk.nsk.GetRawBytes(),
+            spend.note.d,
+            rcm.GetRawBytes(),
+            spend.alpha.GetRawBytes(),
+            spend.note.value(),
+            spend.anchor.GetRawBytes(),
+            witness,
+            cv,
+            rk,
+            sdesc.zkproof)) {
+        return TransactionBuilderResult("Spend proof failed");
+    }
+
+    // 打包返回值和公共参数
+    sdesc.cv = uint256::FromRawBytes(cv);
+    sdesc.rk = uint256::FromRawBytes(rk);
+    sdesc.anchor = spend.anchor;
+    sdesc.nullifier = *nf;
+    mtx.vShieldedSpend.push_back(sdesc);
+}
+
+// Create Sapling OutputDescriptions
+for (auto output : outputs) {
+    // Check this out here as well to provide better logging.
+    // 调用librustzcash计算commitment
+    if (!output.note.cmu()) {
+        return TransactionBuilderResult("Output is invalid");
+    }
+
+    // `Bulid`包含了大量操作，放在下面
+    auto odesc = output.Build(ctx);
+    if (!odesc) {
+        return TransactionBuilderResult("Failed to create output description");
+    }
+
+    mtx.vShieldedOutput.push_back(odesc.value());
+}
+
+// ......
+
+// Create Sapling spendAuth and binding signatures
+// Sapling中的dataToBeSigned包含了整个txdata
+for (size_t i = 0; i < spends.size(); i++) {
+    librustzcash_sapling_spend_sig(
+        spends[i].expsk.ask.begin(),
+        spends[i].alpha.begin(),
+        dataToBeSigned.begin(),
+        mtx.vShieldedSpend[i].spendAuthSig.data());
+}
+ctx->binding_sig(
+    mtx.valueBalanceSapling,
+    dataToBeSigned.GetRawBytes(),
+    mtx.bindingSig);
+```
+
+我们可以看到Sapling中的SpendDescriptions构建思路和Sprout中JSDescriptionInfo的销毁部分十分类似，再来看看OutputDescriptionInfo的构建过程，
+
+```cpp
+std::optional<OutputDescription> OutputDescriptionInfo::Build(rust::Box<sapling::Prover>& ctx) {
+    // 在调用Build前就计算了cmu，直接拿来用
+    auto cmu = this->note.cmu();
+    if (!cmu) {
+        return std::nullopt;
+    }
+
+    // 准备加密，内容包含note和自定义载荷memo
+    libzcash::SaplingNotePlaintext notePlaintext(this->note, this->memo);
+
+    // 加密
+    auto res = notePlaintext.encrypt(this->note.pk_d);
+    if (!res) {
+        return std::nullopt;
+    }
+    auto enc = res.value();
+    auto encryptor = enc.second;
+
+    // 计算接收者的payment address
+    libzcash::SaplingPaymentAddress address(this->note.d, this->note.pk_d);
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << address;
+    std::array<unsigned char, 43> addressBytes;
+    std::move(ss.begin(), ss.end(), addressBytes.begin());
+
+    // 调用librustzcash计算proof
+    std::array<unsigned char, 32> cvBytes;
+    OutputDescription odesc;
+    uint256 rcm = this->note.rcm();
+    if (!ctx->create_output_proof(
+            encryptor.get_esk().GetRawBytes(),
+            addressBytes,
+            rcm.GetRawBytes(),
+            this->note.value(),
+            cvBytes,
+            odesc.zkproof)) {
+        return std::nullopt;
+    }
+
+    // 收集返回值和公共参数
+    odesc.cv = uint256::FromRawBytes(cvBytes);
+    odesc.cmu = *cmu;
+    odesc.ephemeralKey = encryptor.get_epk();
+    odesc.encCiphertext = enc.first;
+
+    // 加密pk_d和esk
+    libzcash::SaplingOutgoingPlaintext outPlaintext(this->note.pk_d, encryptor.get_esk());
+    odesc.outCiphertext = outPlaintext.encrypt(
+        this->ovk,
+        odesc.cv,
+        odesc.cmu,
+        encryptor);
+
+    return odesc;
+}
+```
+
+看到这里，我们可以看到Sapling协议最大的不同就是为每个note的销毁和铸造分别计算不同的证明，而不是针对一连串的铸造和销毁动作计算状态转换的证明。
+
+而为了有效打包这些证明，Sapling使用了更为复杂的签名过程。从上面代码中，我们可以看到Sapling先是为每个SpendDescription生成了分别的`spendAuthSig`，又为整个交易生成了一个`bindingSig`。
+
+前者以每个SpendDescription各自的`expsk.ask`为私钥，以`alpha`为随机因子，重新计算`rk`，然后对包含整个`txdata`的哈希数据签名，
+
+```rust
+pub(crate) fn spend_sig_internal<R: RngCore>(
+    ask: PrivateKey,
+    ar: jubjub::Fr,
+    sighash: &[u8; 32],
+    rng: &mut R,
+) -> Signature {
+    // We compute `rsk`...
+    let rsk = ask.randomize(ar);
+
+    // We compute `rk` from there (needed for key prefixing)
+    let rk = PublicKey::from_private(&rsk, SPENDING_KEY_GENERATOR);
+
+    // Compute the signature's message for rk/spend_auth_sig
+    let mut data_to_be_signed = [0u8; 64];
+    data_to_be_signed[0..32].copy_from_slice(&rk.0.to_bytes());
+    data_to_be_signed[32..64].copy_from_slice(&sighash[..]);
+
+    // Do the signing
+    rsk.sign(&data_to_be_signed, rng, SPENDING_KEY_GENERATOR)
+}
+```
+
+后者则是以我们在value commitment中产生的`bsk`，对`bvk`和包含整个`txdata`的哈希数据签名，
+
+```rust
+// binding_sig in zcash
+fn binding_sig(
+    &mut self,
+    value_balance: i64,
+    sighash: &[u8; 32],
+    result: &mut [u8; 64],
+) -> bool {
+    let value_balance = match Amount::from_i64(value_balance) {
+        Ok(vb) => vb,
+        Err(()) => return false,
+    };
+
+    // Sign
+    // 调用librustzcash计算签名
+    let sig = match self.0.binding_sig(value_balance, sighash) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    // Write out signature
+    sig.write(&mut result[..])
+        .expect("result should be 64 bytes");
+
+    true
+}
+
+// binding_sig in librustzcash
+pub fn binding_sig(&self, value_balance: Amount, sighash: &[u8; 32]) -> Result<Signature, ()> {
+    // Initialize secure RNG
+    let mut rng = OsRng;
+
+    // Grab the current `bsk` from the context
+    let bsk = self.bsk.into_bsk();
+
+    // Grab the `bvk` using DerivePublic.
+    let bvk = PublicKey::from_private(&bsk, VALUE_COMMITMENT_RANDOMNESS_GENERATOR);
+
+    // In order to check internal consistency, let's use the accumulated value
+    // commitments (as the verifier would) and apply value_balance to compare
+    // against our derived bvk.
+    {
+        // Compute the final bvk.
+        let final_bvk = self.cv_sum.into_bvk(value_balance);
+
+        // The result should be the same, unless the provided valueBalance is wrong.
+        if bvk.0 != final_bvk.0 {
+            return Err(());
+        }
+    }
+
+    // Construct signature message
+    let mut data_to_be_signed = [0u8; 64];
+    data_to_be_signed[0..32].copy_from_slice(&bvk.0.to_bytes());
+    data_to_be_signed[32..64].copy_from_slice(&sighash[..]);
+
+    // Sign
+    Ok(bsk.sign(
+        &data_to_be_signed,
+        &mut rng,
+        VALUE_COMMITMENT_RANDOMNESS_GENERATOR,
+    ))
+}
+```
+
+繁多的密钥和参数让事情看起来有些复杂，我们对比一下Sapling相对于Sprout的区别，
+
+1. Sprout只使用了一层签名，Sapling使用了两层；
+2. Sprout的签名针对整个交易，使用JoinSplitPrivateKey计算签名，而JoinSplitPubKey则联合Prover的`ask`，被用于计算每个nullifier的哈希，防止被盗用，和电路无关；
+3. Sapling的第一层签名针对交易中的Spend，使用被`alpha`混淆了的`ask`计算`rk`，被用于证明Prover的身份，`rk`被电路证明；
+4. Sapling的第二层签名针对整笔交易导致的Sapling资金池变动value，这个数值是一个公开值，Sprout也隐性地公开了它。签名使用了从所有value commitment的和获得的`bsk`，`bsk`被电路间接证明。
+
 ## Sapling验证
+
+Zcash协议白皮书曾说Sapling相对于Sprout不再需要维护间接树状态，接下来我们就从Sapling验证过程寻找原因，
+
+### 上下文无关验证
+
+### 上下文验证
+
+### 区块连接
 
 ## 小结

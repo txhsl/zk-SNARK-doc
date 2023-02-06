@@ -2866,12 +2866,351 @@ pub fn binding_sig(&self, value_balance: Amount, sighash: &[u8; 32]) -> Result<S
 
 ## Sapling验证
 
-Zcash协议白皮书曾说Sapling相对于Sprout不再需要维护间接树状态，接下来我们就从Sapling验证过程寻找原因，
+Zcash协议白皮书曾说Sapling相对于Sprout不再维护间接树状态，我们已经排除了单笔交易内部零钱重复铸造销毁的必要，接下来我们再从Sapling协议的验证过程寻找原因。
 
 ### 上下文无关验证
 
+根据我们在分析Sprout时积攒的经验，上下文无关验证仅对交易的格式和规范性进行检测，但是对Sapling的证明验证并不存在于`CheckTransaction()`方法中。简单起见，我们直接从[zcash/librustzcash](https://github.com/zcash/librustzcash/blob/1b5b8d73e6fcc00d93809fb91de2a367b24e1c59/zcash_proofs/src/sapling/verifier.rs#L36)开始，
+
+```rust
+/// A context object for verifying the Sapling components of a Zcash transaction.
+struct SaplingVerificationContextInner {
+    // (sum of the Spend value commitments) - (sum of the Output value commitments)
+    cv_sum: CommitmentSum,
+}
+
+impl SaplingVerificationContextInner {
+    /// Construct a new context to be used with a single transaction.
+    fn new() -> Self {
+        SaplingVerificationContextInner {
+            cv_sum: CommitmentSum::zero(),
+        }
+    }
+
+    /// Perform consensus checks on a Sapling SpendDescription, while
+    /// accumulating its value commitment inside the context for later use.
+    #[allow(clippy::too_many_arguments)]
+    fn check_spend<C>(
+        &mut self,
+        cv: &ValueCommitment,
+        anchor: bls12_381::Scalar,
+        nullifier: &[u8; 32],
+        rk: &PublicKey,
+        sighash_value: &[u8; 32],
+        spend_auth_sig: &Signature,
+        zkproof: Proof<Bls12>,
+        verifier_ctx: &mut C,
+        spend_auth_sig_verifier: impl FnOnce(&mut C, &PublicKey, [u8; 64], &Signature) -> bool,
+        proof_verifier: impl FnOnce(&mut C, Proof<Bls12>, [bls12_381::Scalar; 7]) -> bool,
+    ) -> bool {
+        // The "cv is not small order" happens when a SpendDescription is deserialized.
+        // This happens when transactions or blocks are received over the network, or when
+        // mined blocks are introduced via the `submitblock` RPC method on full nodes.
+        if rk.0.is_small_order().into() {
+            return false;
+        }
+
+        // Accumulate the value commitment in the context
+        self.cv_sum += cv;
+
+        // Grab the nullifier as a sequence of bytes
+        let nullifier = &nullifier[..];
+
+        // Compute the signature's message for rk/spend_auth_sig
+        let mut data_to_be_signed = [0u8; 64];
+        data_to_be_signed[0..32].copy_from_slice(&rk.0.to_bytes());
+        data_to_be_signed[32..64].copy_from_slice(&sighash_value[..]);
+
+        // Verify the spend_auth_sig
+        let rk_affine = rk.0.to_affine();
+        if !spend_auth_sig_verifier(verifier_ctx, rk, data_to_be_signed, spend_auth_sig) {
+            return false;
+        }
+
+        // Construct public input for circuit
+        let mut public_input = [bls12_381::Scalar::zero(); 7];
+        {
+            let affine = rk_affine;
+            let (u, v) = (affine.get_u(), affine.get_v());
+            public_input[0] = u;
+            public_input[1] = v;
+        }
+        {
+            let affine = cv.as_inner().to_affine();
+            let (u, v) = (affine.get_u(), affine.get_v());
+            public_input[2] = u;
+            public_input[3] = v;
+        }
+        public_input[4] = anchor;
+
+        // Add the nullifier through multiscalar packing
+        {
+            let nullifier = multipack::bytes_to_bits_le(nullifier);
+            let nullifier = multipack::compute_multipacking(&nullifier);
+
+            assert_eq!(nullifier.len(), 2);
+
+            public_input[5] = nullifier[0];
+            public_input[6] = nullifier[1];
+        }
+
+        // Verify the proof
+        proof_verifier(verifier_ctx, zkproof, public_input)
+    }
+
+    /// Perform consensus checks on a Sapling OutputDescription, while
+    /// accumulating its value commitment inside the context for later use.
+    fn check_output(
+        &mut self,
+        cv: &ValueCommitment,
+        cmu: ExtractedNoteCommitment,
+        epk: jubjub::ExtendedPoint,
+        zkproof: Proof<Bls12>,
+        proof_verifier: impl FnOnce(Proof<Bls12>, [bls12_381::Scalar; 5]) -> bool,
+    ) -> bool {
+        // The "cv is not small order" happens when an OutputDescription is deserialized.
+        // This happens when transactions or blocks are received over the network, or when
+        // mined blocks are introduced via the `submitblock` RPC method on full nodes.
+        if epk.is_small_order().into() {
+            return false;
+        }
+
+        // Accumulate the value commitment in the context
+        self.cv_sum -= cv;
+
+        // Construct public input for circuit
+        let mut public_input = [bls12_381::Scalar::zero(); 5];
+        {
+            let affine = cv.as_inner().to_affine();
+            let (u, v) = (affine.get_u(), affine.get_v());
+            public_input[0] = u;
+            public_input[1] = v;
+        }
+        {
+            let affine = epk.to_affine();
+            let (u, v) = (affine.get_u(), affine.get_v());
+            public_input[2] = u;
+            public_input[3] = v;
+        }
+        public_input[4] = bls12_381::Scalar::from_repr(cmu.to_bytes()).unwrap();
+
+        // Verify the proof
+        proof_verifier(zkproof, public_input)
+    }
+
+    /// Perform consensus checks on the valueBalance and bindingSig parts of a
+    /// Sapling transaction. All SpendDescriptions and OutputDescriptions must
+    /// have been checked before calling this function.
+    fn final_check(
+        &self,
+        value_balance: Amount,
+        sighash_value: &[u8; 32],
+        binding_sig: Signature,
+        binding_sig_verifier: impl FnOnce(PublicKey, [u8; 64], Signature) -> bool,
+    ) -> bool {
+        // Compute the final bvk.
+        let bvk = self.cv_sum.into_bvk(value_balance);
+
+        // Compute the signature's message for bvk/binding_sig
+        let mut data_to_be_signed = [0u8; 64];
+        data_to_be_signed[0..32].copy_from_slice(&bvk.0.to_bytes());
+        data_to_be_signed[32..64].copy_from_slice(&sighash_value[..]);
+
+        // Verify the binding_sig
+        binding_sig_verifier(bvk, data_to_be_signed, binding_sig)
+    }
+}
+```
+
+整个证明的验证过程比较简单，先分别还原SpendDescription和OutputDescription的public_input，验证单个描述中携带的证明，最后再集合统计整笔交易的value commitment，计算为`bvk`后验证交易的`bindingSig`。
+
 ### 上下文验证
+
+我们着眼的树状态问题也不在这部分处理，具体内容和Sprout基本相同，有需要可以直接回看上一部分。
 
 ### 区块连接
 
+在上一个协议的介绍中，我们已经对`ConnectBlock()`方法的基本作用有了了解，这里只看一些不同的地方，
+
+```cpp
+bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pindex,
+                  CCoinsViewCache& view, const CChainParams& chainparams,
+                  bool fJustCheck, CheckAs blockChecks)
+{
+    // ......
+
+    // Reject a block that results in a negative shielded value pool balance.
+    if (chainparams.ZIP209Enabled()) {
+        // ......
+
+        // Sapling
+        //
+        // If we've reached ConnectBlock, we have all transactions of
+        // parents and can expect nChainSaplingValue not to be std::nullopt.
+        // However, the miner and mining RPCs may not have populated this
+        // value and will call `TestBlockValidity`. So, we act
+        // conditionally.
+        if (pindex->nChainSaplingValue) {
+            if (*pindex->nChainSaplingValue < 0) {
+                return state.DoS(100, error("ConnectBlock(): turnstile violation in Sapling shielded value pool"),
+                             REJECT_INVALID, "turnstile-violation-sapling-shielded-pool");
+            }
+        }
+
+        // ......
+    }
+
+    // ......
+
+    SaplingMerkleTree sapling_tree;
+    assert(view.GetSaplingAnchorAt(view.GetBestAnchor(SAPLING), sapling_tree));
+
+    // ......
+
+    // Grab the consensus branch ID for this block and its parent
+    // 以下两个参数主要帮助Zcash通过共识分叉点，不必重视
+    auto consensusBranchId = CurrentEpochBranchId(pindex->nHeight, chainparams.GetConsensus());
+    auto prevConsensusBranchId = CurrentEpochBranchId(pindex->nHeight - 1, chainparams.GetConsensus());
+
+    size_t total_sapling_tx = 0;
+    std::vector<PrecomputedTransactionData> txdata;
+    txdata.reserve(block.vtx.size()); // Required so that pointers to individual PrecomputedTransactionData don't get invalidated
+    for (unsigned int i = 0; i < block.vtx.size(); i++)
+    {
+        const CTransaction &tx = block.vtx[i];
+        const uint256 hash = tx.GetHash();
+
+        nInputs += tx.vin.size();
+        nSigOps += GetLegacySigOpCount(tx);
+        if (nSigOps > MAX_BLOCK_SIGOPS)
+            return state.DoS(100, error("ConnectBlock(): too many sigops"),
+                             REJECT_INVALID, "bad-blk-sigops");
+
+        // Coinbase transactions are the only case where this vector will not be the same
+        // length as `tx.vin` (since coinbase transactions have a single synthetic input).
+        // Only shielded coinbase transactions will need to produce sighashes for coinbase
+        // transactions; this is handled in ZIP 244 by having the coinbase sighash be the
+        // txid.
+        std::vector<CTxOut> allPrevOutputs;
+
+        // Are the shielded spends' requirements met?
+        if (!Consensus::CheckTxShieldedInputs(tx, state, view, 100)) {
+            return false;
+        }
+
+        if (!tx.IsCoinBase())
+        {
+            if (!view.HaveInputs(tx))
+                return state.DoS(100, error("ConnectBlock(): inputs missing/spent"),
+                                 REJECT_INVALID, "bad-txns-inputs-missingorspent");
+
+            for (const auto& input : tx.vin) {
+                const auto prevout = view.GetOutputFor(input);
+                transparentValueDelta -= prevout.nValue;
+                allPrevOutputs.push_back(prevout);
+            }
+
+            // ......
+        }
+
+        txdata.emplace_back(tx, allPrevOutputs);
+
+        // ......
+
+        // Check shielded inputs.
+        if (!ContextualCheckShieldedInputs(
+            tx,
+            txdata.back(),
+            state,
+            view,
+            saplingAuth,
+            orchardAuth,
+            chainparams.GetConsensus(),
+            consensusBranchId,
+            chainparams.GetConsensus().NetworkUpgradeActive(pindex->nHeight, Consensus::UPGRADE_NU5),
+            true))
+        {
+            return error(
+                "ConnectBlock(): ContextualCheckShieldedInputs() on %s failed with %s",
+                tx.GetHash().ToString(),
+                FormatStateMessage(state));
+        }
+
+        // ......
+
+        for (const OutputDescription &outputDescription : tx.vShieldedOutput) {
+            sapling_tree.append(outputDescription.cmu);
+        }
+
+        // ......
+
+        if (!(tx.vShieldedSpend.empty() && tx.vShieldedOutput.empty())) {
+            total_sapling_tx += 1;
+        }
+
+        // ......
+
+        vPos.push_back(std::make_pair(tx.GetHash(), pos));
+        pos.nTxOffset += ::GetSerializeSize(tx, SER_DISK, CLIENT_VERSION);
+    }
+
+    // ......
+    
+    view.PushAnchor(sapling_tree);
+
+    // ......
+
+    // add this block to the view's block chain
+    view.SetBestBlock(pindex->GetBlockHash());
+
+    // ......
+
+    return true;
+}
+```
+
+在省略了大量非关键代码之后，事件看起来变得比之前更简单了。`ConnectBlock()`先是取出了现在的树状态，然后验证交易中所有输入的状态合法性，最后把output添加到树上。
+
+如果阅读完整的方法代码，我们可以发现`ConnectBlock()`对Sprout和Sapling的description的处理逻辑是类似的，真正的不同在于`CheckShieldedRequirements()`这个深层调用。这个方法在处理JoinSplit时需要反复地添加和修改SproutMerkleTree，那么Sapling中又有什么不同呢，
+
+```cpp
+tl::expected<void, UnsatisfiedShieldedReq> CCoinsViewCache::CheckShieldedRequirements(const CTransaction& tx) const
+{
+    // ......
+
+    for (const SpendDescription &spendDescription : tx.vShieldedSpend) {
+        if (GetNullifier(spendDescription.nullifier, SAPLING)) { // Prevent double spends
+            auto txid = tx.GetHash().ToString();
+            auto nf = spendDescription.nullifier.ToString();
+            TracingWarn("consensus", "Sapling double-spend detected",
+                "txid", txid.c_str(),
+                "nf", nf.c_str());
+            return tl::unexpected(UnsatisfiedShieldedReq::SaplingDuplicateNullifier);
+        }
+
+        SaplingMerkleTree tree;
+        if (!GetSaplingAnchorAt(spendDescription.anchor, tree)) {
+            auto txid = tx.GetHash().ToString();
+            auto anchor = spendDescription.anchor.ToString();
+            TracingWarn("consensus", "Transaction uses unknown Sapling anchor",
+                "txid", txid.c_str(),
+                "anchor", anchor.c_str());
+            return tl::unexpected(UnsatisfiedShieldedReq::SaplingUnknownAnchor);
+        }
+    }
+
+    // ......
+
+    return {};
+}
+```
+
+没错，Sapling只对spend description进行状态验证，而没有对output description改变的状态做出实时更新。我们在`ConnectBlock()`也看到了，输入的验证和输出的更新是前后进行的。
+
+这意味着在Sapling中，同一笔交易的Spend输入不能引用自己的Output输出。形式化地来说，每一个spend description的anchor都必须在之前其他的交易当中，这和我们对传统UTXO交易的理解是相同的。
+
 ## 小结
+
+本篇介绍了Sapling协议在Zcash中的具体实施细节，包括证明的生成、交易的构建、交易的验证和证明的验证。
+
+相比之前介绍的Sprout协议，Sapling协议在交易签名和树状态维护上存在很大不同。在签名上，该协议使用同态的value commitment计算签名，在证明电路外保证balance的平衡；在树状态维护上，该协议不再维护间隙的树状态，不仅避免重复铸造和销毁零钱，也简化了交易的构架和验证逻辑。

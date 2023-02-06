@@ -1850,7 +1850,7 @@ return true;
 
 ### 上下文无关验证
 
-根据一些众所周知的常识，作为Verifier的Zcash节点首先以区块的形式接收到交易，我们可以在[zcash/zcash/src/main.cpp](https://github.com/zcash/zcash/blob/b63c58500a800938819a3bd9c1e78a7f6f9c787a/src/main.cpp#L4753)找到这个入口，
+根据一些众所周知的常识，作为Verifier的Zcash节点首先以区块的形式接收到交易，我们可以在[zcash/zcash/src/main.cpp](https://github.com/zcash/zcash/blob/adfc7218435faa1c8985a727f997a795dcffa0c7/src/main.cpp#L4868)找到这个入口，
 
 ```cpp
 bool CheckBlock(const CBlock& block,
@@ -1973,7 +1973,7 @@ uint256 BlockMerkleRoot(const CBlock& block, bool* mutated)
 }
 ```
 
-Zcash交易验证的过程发生在[`CheckTransaction()`](https://github.com/zcash/zcash/blob/b63c58500a800938819a3bd9c1e78a7f6f9c787a/src/main.cpp#L1381)，对应如下代码，
+Zcash交易验证的过程发生在[`CheckTransaction()`](https://github.com/zcash/zcash/blob/adfc7218435faa1c8985a727f997a795dcffa0c7/src/main.cpp#L1381)，对应如下代码，
 
 ```cpp
 bool CheckTransaction(const CTransaction& tx, CValidationState &state,
@@ -2005,7 +2005,7 @@ bool CheckTransaction(const CTransaction& tx, CValidationState &state,
 }
 ```
 
-其中的`CheckTransactionWithoutProofVerification()`也定义在在[zcash/zcash/src/main.cpp](https://github.com/zcash/zcash/blob/b63c58500a800938819a3bd9c1e78a7f6f9c787a/src/main.cpp#L1418)，下面截取其中和Sprout有关的一部分，
+其中的`CheckTransactionWithoutProofVerification()`也定义在在[zcash/zcash/src/main.cpp](https://github.com/zcash/zcash/blob/adfc7218435faa1c8985a727f997a795dcffa0c7/src/main.cpp#L1418)，下面截取其中和Sprout有关的一部分，
 
 ```cpp
 /**
@@ -2195,7 +2195,7 @@ bool ProofVerifier::VerifySprout(
 
 ### 上下文验证
 
-上下文有关的区块验证同样发生在[zcash/zcash/src/main.cpp](https://github.com/zcash/zcash/blob/b63c58500a800938819a3bd9c1e78a7f6f9c787a/src/main.cpp#L4896)，对应下面的代码，
+上下文有关的区块验证同样发生在[zcash/zcash/src/main.cpp](https://github.com/zcash/zcash/blob/adfc7218435faa1c8985a727f997a795dcffa0c7/src/main.cpp#L5011)，对应下面的代码，
 
 ```cpp
 bool ContextualCheckBlock(
@@ -2341,7 +2341,7 @@ bool ContextualCheckTransaction(
 
 ### 区块连接
 
-在满足区块头验证、上下文无关验证和上下文验证之后，我们距离认为Zcash上的某个区块或者某笔交易是合法的还差最后一步。因为并非所有的Zcash交易都是隐私遮蔽的，隐私证明数据的验证被放到了最后，也就是方法`ConnectBlock()`，这部分代码很长，但我们还是尽可能全地阅读一遍，
+在满足区块头验证、上下文无关验证和上下文验证之后，我们距离认为Zcash上的某个区块或者某笔交易是合法的还差最后一步，也就是方法`ConnectBlock()`，这部分代码很长，但我们还是尽可能全地阅读一遍，
 
 ```cpp
 bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pindex,
@@ -2415,7 +2415,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
 
     // Construct the incremental merkle tree at the current
     // block position,
-    // 找到三个协议各自incremental merkle tree目前合适添加新节点的位置，再验证一次结果
+    // 找到协议incremental merkle tree目前合适添加新节点的位置，再验证一次结果
     auto old_sprout_tree_root = view.GetBestAnchor(SPROUT);
     // saving the top anchor in the block index as we go.
     if (!fJustCheck) {
@@ -2431,31 +2431,14 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         assert(sprout_tree.root() == old_sprout_tree_root);
     }
 
-    SaplingMerkleTree sapling_tree;
-    assert(view.GetSaplingAnchorAt(view.GetBestAnchor(SAPLING), sapling_tree));
-
-    OrchardMerkleFrontier orchard_tree;
-    if (pindex->pprev && chainparams.GetConsensus().NetworkUpgradeActive(pindex->pprev->nHeight, Consensus::UPGRADE_NU5)) {
-        // Verify that the view's current state corresponds to the previous block.
-        assert(pindex->pprev->hashFinalOrchardRoot == view.GetBestAnchor(ORCHARD));
-        // We only call ConnectBlock() on top of the active chain's tip.
-        assert(!pindex->pprev->hashFinalOrchardRoot.IsNull());
-
-        assert(view.GetOrchardAnchorAt(pindex->pprev->hashFinalOrchardRoot, orchard_tree));
-    } else {
-        if (pindex->pprev) {
-            assert(pindex->pprev->hashFinalOrchardRoot.IsNull());
-        }
-        assert(view.GetOrchardAnchorAt(OrchardMerkleFrontier::empty_root(), orchard_tree));
-    }
+    // ......
 
     // Grab the consensus branch ID for this block and its parent
     // 以下两个参数主要帮助Zcash通过共识分叉点，不必重视
     auto consensusBranchId = CurrentEpochBranchId(pindex->nHeight, chainparams.GetConsensus());
     auto prevConsensusBranchId = CurrentEpochBranchId(pindex->nHeight - 1, chainparams.GetConsensus());
 
-    size_t total_sapling_tx = 0;
-    size_t total_orchard_tx = 0;
+    // ......
 
     std::vector<PrecomputedTransactionData> txdata;
     txdata.reserve(block.vtx.size()); // Required so that pointers to individual PrecomputedTransactionData don't get invalidated
@@ -2496,37 +2479,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
             }
 
             // insightexplorer
-            // https://github.com/bitpay/bitcoin/commit/017f548ea6d89423ef568117447e61dd5707ec42#diff-7ec3c68a81efff79b6ca22ac1f1eabbaR2597
-            // 将销毁的信息记录到addressIndex、addressUnspentIndex和spentIndex，它们作为局部变量，原本都为空
-            if (fAddressIndex || fSpentIndex) {
-                for (size_t j = 0; j < tx.vin.size(); j++) {
-
-                    const CTxIn input = tx.vin[j];
-                    const CTxOut &prevout = allPrevOutputs[j];
-                    CScript::ScriptType scriptType = prevout.scriptPubKey.GetType();
-                    const uint160 addrHash = prevout.scriptPubKey.AddressHash();
-                    if (fAddressIndex && scriptType != CScript::UNKNOWN) {
-                        // record spending activity
-                        addressIndex.push_back(make_pair(
-                            CAddressIndexKey(scriptType, addrHash, pindex->nHeight, i, hash, j, true),
-                            prevout.nValue * -1));
-
-                        // remove address from unspent index
-                        addressUnspentIndex.push_back(make_pair(
-                            CAddressUnspentKey(scriptType, addrHash, input.prevout.hash, input.prevout.n),
-                            CAddressUnspentValue()));
-                    }
-                    if (fSpentIndex) {
-                        // Add the spent index to determine the txid and input that spent an output
-                        // and to find the amount and address from an input.
-                        // If we do not recognize the script type, we still add an entry to the
-                        // spentindex db, with a script type of 0 and addrhash of all zeroes.
-                        spentIndex.push_back(make_pair(
-                            CSpentIndexKey(input.prevout.hash, input.prevout.n),
-                            CSpentIndexValue(hash, j, pindex->nHeight, prevout.nValue, scriptType, addrHash)));
-                    }
-                }
-            }
+            // ......
 
             // Add in sigops done by pay-to-script-hash inputs;
             // this is to prevent a "rogue miner" from creating
@@ -2572,27 +2525,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         }
 
         // insightexplorer
-        // https://github.com/bitpay/bitcoin/commit/017f548ea6d89423ef568117447e61dd5707ec42#diff-7ec3c68a81efff79b6ca22ac1f1eabbaR2656
-        // 将铸造的信息记录到addressIndex和addressUnspentIndex，它们作为局部变量，原本都为空
-        if (fAddressIndex) {
-            for (unsigned int k = 0; k < tx.vout.size(); k++) {
-                const CTxOut &out = tx.vout[k];
-                CScript::ScriptType scriptType = out.scriptPubKey.GetType();
-                if (scriptType != CScript::UNKNOWN) {
-                    uint160 const addrHash = out.scriptPubKey.AddressHash();
-
-                    // record receiving activity
-                    addressIndex.push_back(make_pair(
-                        CAddressIndexKey(scriptType, addrHash, pindex->nHeight, i, hash, k, false),
-                        out.nValue));
-
-                    // record unspent output
-                    addressUnspentIndex.push_back(make_pair(
-                        CAddressUnspentKey(scriptType, addrHash, hash, k),
-                        CAddressUnspentValue(out.nValue, out.scriptPubKey, pindex->nHeight)));
-                }
-            }
-        }
+        // ......
 
         // 将销毁和铸造的结果暂存，同时准备好回滚需要的信息，以防万一
         // void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txundo, int nHeight)
@@ -2630,7 +2563,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         }
         UpdateCoins(tx, view, i == 0 ? undoDummy : blockundo.vtxundo.back(), pindex->nHeight);
 
-        // 将隐匿output的commitment添加到三个协议的incremental merkle tree
+        // 将隐匿output的commitment添加到incremental merkle tree
         for (const JSDescription &joinsplit : tx.vJoinSplit) {
             for (const uint256 &note_commitment : joinsplit.commitments) {
                 // Insert the note commitments into our temporary tree.
@@ -2639,23 +2572,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
             }
         }
 
-        for (const OutputDescription &outputDescription : tx.vShieldedOutput) {
-            sapling_tree.append(outputDescription.cmu);
-        }
-
-        if (!orchard_tree.AppendBundle(tx.GetOrchardBundle())) {
-            return state.DoS(100,
-                error("ConnectBlock(): block would overfill the Orchard commitment tree."),
-                REJECT_INVALID, "orchard-commitment-tree-full");
-        };
-
-        if (!(tx.vShieldedSpend.empty() && tx.vShieldedOutput.empty())) {
-            total_sapling_tx += 1;
-        }
-
-        if (tx.GetOrchardBundle().IsPresent()) {
-            total_orchard_tx += 1;
-        }
+        // ......
 
         vPos.push_back(std::make_pair(tx.GetHash(), pos));
         pos.nTxOffset += ::GetSerializeSize(tx, SER_DISK, CLIENT_VERSION);
@@ -2698,8 +2615,6 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
     //     }
     // }
     view.PushAnchor(sprout_tree);
-    view.PushAnchor(sapling_tree);
-    view.PushAnchor(orchard_tree);
     
     // ......
 
@@ -2759,43 +2674,8 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         if (!pblocktree->WriteTxIndex(vPos))
             return AbortNode(state, "Failed to write transaction index");
 
-    // START insightexplorer
-    // 写入之前记录的索引数据用于展示
-    if (fAddressIndex) {
-        if (!pblocktree->WriteAddressIndex(addressIndex)) {
-            return AbortNode(state, "Failed to write address index");
-        }
-        if (!pblocktree->UpdateAddressUnspentIndex(addressUnspentIndex)) {
-            return AbortNode(state, "Failed to write address unspent index");
-        }
-    }
-    if (fSpentIndex) {
-        if (!pblocktree->UpdateSpentIndex(spentIndex)) {
-            return AbortNode(state, "Failed to write spent index");
-        }
-    }
-    // 写入其他的信息
-    if (fTimestampIndex) {
-        unsigned int logicalTS = pindex->nTime;
-        unsigned int prevLogicalTS = 0;
-
-        // retrieve logical timestamp of the previous block
-        if (pindex->pprev)
-            if (!pblocktree->ReadTimestampBlockIndex(pindex->pprev->GetBlockHash(), prevLogicalTS))
-                LogPrintf("%s: Failed to read previous block's logical timestamp\n", __func__);
-
-        if (logicalTS <= prevLogicalTS) {
-            logicalTS = prevLogicalTS + 1;
-            LogPrintf("%s: Previous logical timestamp is newer Actual[%d] prevLogical[%d] Logical[%d]\n", __func__, pindex->nTime, prevLogicalTS, logicalTS);
-        }
-
-        if (!pblocktree->WriteTimestampIndex(CTimestampIndexKey(logicalTS, pindex->GetBlockHash())))
-            return AbortNode(state, "Failed to write timestamp index");
-
-        if (!pblocktree->WriteTimestampBlockIndex(CTimestampBlockIndexKey(pindex->GetBlockHash()), CTimestampBlockIndexValue(logicalTS)))
-            return AbortNode(state, "Failed to write blockhash index");
-    }
-    // END insightexplorer
+    // insightexplorer
+    // ......
 
     // add this block to the view's block chain
     // 将区块添加到当前区块链
@@ -2834,7 +2714,7 @@ bool CheckTxShieldedInputs(
 }
 ```
 
-注释也说明，这是对隐匿输入合法性的验证，可以看到又调用到了`CheckShieldedRequirements()`，我们只看其中的Sprout部分，
+注释也说明，这是对隐匿输入合法性的验证，可以看到又调用到了`CheckShieldedRequirements()`，我们只看其中的Sprout部分，这里也是我们寻找的，维护间隙树状态的关键，**每一个JoinSplit的commitment都被实时更新到树，从而能被同一笔交易的其他JoinSplit马上使用**，
 
 ```cpp
 tl::expected<void, UnsatisfiedShieldedReq> CCoinsViewCache::CheckShieldedRequirements(const CTransaction& tx) const

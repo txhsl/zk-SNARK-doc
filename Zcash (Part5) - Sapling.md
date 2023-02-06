@@ -1,10 +1,10 @@
-# Zcash Part5
-
-## Sapling
+# Zcash (Part5) - Sapling
 
 看完了Sprout，我们来看Sapling，这个协议只对每一个input和output生成分别的证明。在上一节中我们知道，Sprout协议处理复杂交易时JoinSplit要完成零钱Note的反复铸造和销毁，毫无疑问在性能上有很大的提升空间。
 
 针对Sprout协议存在的性能短板，Zcash提出了作为改进的Sapling协议。在之前的内容中，我们已经知道Sapling是在Sprout基础上重建的协议，甚至地址上可以相互兼容，因此它们的相似程度也非常高。
+
+## Sapling证明
 
 ### Zcash入口
 

@@ -1,4 +1,4 @@
-# Zcash Part2
+# Zcash (Part2) - ZK Basic
 
 ## NP问题
 

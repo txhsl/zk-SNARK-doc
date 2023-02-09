@@ -146,9 +146,11 @@ Commitment的计算方法如下：
 
 ## Commitment树
 
-Zcash的Commitment树是一棵只增的Merkle树，它不被用于防止双花，而是只记录产生过的Note Commitment，每层至多添加$2^{h}$个节点。
+Zcash的Commitment树是一棵只增的Merkle树，它不被用于防止双花，而是只记录产生过的Note Commitment，每层至多添加$2^{h}$个节点。每当有新的Commitment加入时，它会被顺序添加到树在叶子层的下一个可用节点，并导致树的root哈希发生改变。
 
-尽管Commitment树是只增的，但是每个协议能够使用的Merkle树深度都是有限的。Sprout协议只能使用到深度29，Sapling协议和Orchard协议只能使用到深度32。这意味着当Commitment的总数达到指定深度时，用户无法再使用对应的协议产生新的Commitment。
+尽管Commitment树是只增的，但是每个协议使用的Merkle树深度都是固定的，因此可添加的叶子节点也是有限的。Sprout协议使用的深度为29，也就是可用$2^{29}$个叶子节点，Sapling协议和Orchard协议使用的深度为32，也就是可用$2^{32}$个叶子节点。这意味着当Commitment的总数达到指定上限时，用户无法再使用对应的协议产生新的Commitment。
+
+协议Merkle树的深度也决定了计算root哈希的复杂程度，越深的树能提供越多的可用叶子节点，但是在计算证明时也需要处理更长的哈希路径。
 
 ## Nullifier集合
 

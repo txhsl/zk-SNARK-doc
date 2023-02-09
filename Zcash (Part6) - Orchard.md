@@ -1,10 +1,19 @@
-# Zcash Part6
+# Zcash (Part6) - Orchard
 
-## Orchard
+和Sapling协议不同，Orchard做出的改动并非电路逻辑上的改良，而是对ZK加密方案的替换。为此，我们需要知道Orchard提出的技术背景，
+
+1. Sprout和Sapling都无法与现有的性能扩展技术兼容。Zcash期望使用Recursive zero-knowledge proofs (可循环折叠的证明)，但是从Sprout中使用哈希函数而非椭圆曲线计算密钥，到Sapling中开始使用的Jubjub曲线，都还和该技术的理论要求存在距离；
+2. Sprout和Sapling使用的Groth16证明方案，需要一个可信的初始化，也就是从MPC计算公共SRS。只要MPC参与方中有一方诚实就可以完成参数生成，但是客观上这一过程是不可逆的。基于MPC方案的初始化本身来说就是一个风险点。Sprout在BCTV14时期就因为证明方案的一个漏洞，使得Sprout证明能够被伪造，最后导致了一次升级，要求了一次全面的新MPC。
+
+## Orchard证明
 
 和Sapling稍有不同，Orchard现阶段是zcash/zcash的一个外部调用，我们可以在[zcash/orchard](https://github.com/zcash/orchard)找到它。因此Orchard的调用路线和之前两个协议的“zcash->librustzcash->bellman”调用路线会有明显不同。
 
-我们倒过来看，Orchard基于Halo2重新定义了Action电路，我们可以在[zcash/orchard/src/circuit.rs]()找到它，对应下面的代码，
+### 证明电路
+
+#### Circuit
+
+我们改变一下顺序，先从熟悉的电路开始。Orchard基于Halo2重新实现了Action电路，我们可以在[zcash/orchard/src/circuit.rs](https://github.com/zcash/orchard/blob/5fbbded49e3162a31fd3bb0de3c344f3cc4dfa60/src/circuit.rs)找到其中的集成电路，
 
 ```rust
 pub struct Circuit {
@@ -55,45 +64,60 @@ impl Circuit {
             .then(|| Self::from_action_context_unchecked(spend, output_note, alpha, rcv))
     }
 
+    /// 从context获取action包含的信息，传入电路
     pub(crate) fn from_action_context_unchecked(
-        spend: SpendInfo,
-        output_note: Note,
+        spend: SpendInfo, // Spend
+        output_note: Note, // Output
         alpha: pallas::Scalar,
         rcv: ValueCommitTrapdoor,
     ) -> Circuit {
+        // 销毁note的接收地址，熟悉的rho和随机种子rseed
         let sender_address = spend.note.recipient();
         let rho_old = spend.note.rho();
         let psi_old = spend.note.rseed().psi(&rho_old);
         let rcm_old = spend.note.rseed().rcm(&rho_old);
-
+        // 铸造note的rho和rseed
         let rho_new = output_note.rho();
         let psi_new = output_note.rseed().psi(&rho_new);
         let rcm_new = output_note.rseed().rcm(&rho_new);
 
         Circuit {
+            // merkle_path
             path: Value::known(spend.merkle_path.auth_path()),
             pos: Value::known(spend.merkle_path.position()),
+            // sender_address
             g_d_old: Value::known(sender_address.g_d()),
             pk_d_old: Value::known(*sender_address.pk_d()),
+            // spend_note
             v_old: Value::known(spend.note.value()),
             rho_old: Value::known(rho_old),
             psi_old: Value::known(psi_old),
             rcm_old: Value::known(rcm_old),
             cm_old: Value::known(spend.note.commitment()),
+            // action的随机种子alpha
             alpha: Value::known(alpha),
+            // spending_key的衍生密钥full_viewing_key
             ak: Value::known(spend.fvk.clone().into()),
             nk: Value::known(*spend.fvk.nk()),
             rivk: Value::known(spend.fvk.rivk(spend.scope)),
+            // output_note
             g_d_new: Value::known(output_note.recipient().g_d()),
             pk_d_new: Value::known(*output_note.recipient().pk_d()),
             v_new: Value::known(output_note.value()),
             psi_new: Value::known(psi_new),
             rcm_new: Value::known(rcm_new),
+            // value_commitment需要的随机量
             rcv: Value::known(rcv),
         }
     }
 }
+```
 
+这里定义的`Circuit`不再是我们之前理解的广义电路，而是包含多个芯片的Orchard专用集成电路。除了些许的不同，上述电路要求的参数都和Sapling电路使用的参数类似，而电路又重新合并为整块，这一点和Sprout类似。
+
+让我们感到陌生的应当是电路约束的转换过程，Orchard使用下面的方法设置和加载电路，
+
+```rust
 impl plonk::Circuit<pallas::Base> for Circuit {
     type Config = Config;
     type FloorPlanner = floor_planner::V1;
@@ -102,6 +126,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         Self::default()
     }
 
+    /// 集成电路的设置方法，创建一些基础约束
     fn configure(meta: &mut plonk::ConstraintSystem<pallas::Base>) -> Self::Config {
         // Advice columns used in the Orchard circuit.
         let advices = [
@@ -117,9 +142,14 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             meta.advice_column(),
         ];
 
+        /// 对于Orchard action的约束
+        /// value平衡的约束
         // Constrain v_old - v_new = magnitude * sign    (https://p.z.cash/ZKS:action-cv-net-integrity?partial).
+        /// merkle root相同的约束
         // Either v_old = 0, or calculated root = anchor (https://p.z.cash/ZKS:action-merkle-path-validity?partial).
+        /// action是否配置spend输入和实际情况相同的约束
         // Constrain v_old = 0 or enable_spends = 1      (https://p.z.cash/ZKS:action-enable-spend).
+        /// action是否配置output输出和实际情况相同的约束
         // Constrain v_new = 0 or enable_outputs = 1     (https://p.z.cash/ZKS:action-enable-output).
         let q_orchard = meta.selector();
         meta.create_gate("Orchard circuit checks", |meta| {
@@ -160,9 +190,11 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             )
         });
 
+        /// 调用加法子电路的设置
         // Addition of two field elements.
         let add_config = AddChip::configure(meta, advices[7], advices[8], advices[6]);
 
+        /// 准备Sinsemilla哈希子电路的设置做准备
         // Fixed columns for the Sinsemilla generator lookup table
         let table_idx = meta.lookup_table_column();
         let lookup = (
@@ -180,6 +212,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             meta.enable_equality(*advice);
         }
 
+        /// 为Poseidon哈希子电路和ECC子电路的设置做准备
         // Poseidon requires four advice columns, while ECC incomplete addition requires
         // six, so we could choose to configure them in parallel. However, we only use a
         // single Poseidon invocation, and we have the rows to accommodate it serially.
@@ -198,19 +231,23 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         let rc_a = lagrange_coeffs[2..5].try_into().unwrap();
         let rc_b = lagrange_coeffs[5..8].try_into().unwrap();
 
+        /// 预留全局约束的空间
         // Also use the first Lagrange coefficient column for loading global constants.
         // It's free real estate :)
         meta.enable_constant(lagrange_coeffs[0]);
 
+        /// 调用范围验证子电路的设置
         // We have a lot of free space in the right-most advice columns; use one of them
         // for all of our range checks.
         let range_check = LookupRangeCheckConfig::configure(meta, advices[9], table_idx);
 
+        /// 设置ECC子电路
         // Configuration for curve point operations.
         // This uses 10 advice columns and spans the whole circuit.
         let ecc_config =
             EccChip::<OrchardFixedBases>::configure(meta, advices, lagrange_coeffs, range_check);
 
+        /// 设置Poseidon哈希子电路
         // Configuration for the Poseidon hash.
         let poseidon_config = PoseidonChip::configure::<poseidon::P128Pow5T3>(
             meta,
@@ -222,6 +259,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             rc_b,
         );
 
+        /// 设置Sinsemilla哈希子电路，和一个使用该哈希的Merkle计算子电路
         // Configuration for a Sinsemilla hash instantiation and a
         // Merkle hash instantiation using this Sinsemilla instance.
         // Since the Sinsemilla config uses only 5 advice columns,
@@ -240,6 +278,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             (sinsemilla_config_1, merkle_config_1)
         };
 
+        /// 再设置一份
         // Configuration for a Sinsemilla hash instantiation and a
         // Merkle hash instantiation using this Sinsemilla instance.
         // Since the Sinsemilla config uses only 5 advice columns,
@@ -258,20 +297,24 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             (sinsemilla_config_2, merkle_config_2)
         };
 
+        /// 调用设置ivk子电路
         // Configuration to handle decomposition and canonicity checking
         // for CommitIvk.
         let commit_ivk_config = CommitIvkChip::configure(meta, advices);
 
+        /// 调用设置旧note的处理电路
         // Configuration to handle decomposition and canonicity checking
         // for NoteCommit_old.
         let old_note_commit_config =
             NoteCommitChip::configure(meta, advices, sinsemilla_config_1.clone());
 
+        /// 调用设置新note的处理电路
         // Configuration to handle decomposition and canonicity checking
         // for NoteCommit_new.
         let new_note_commit_config =
             NoteCommitChip::configure(meta, advices, sinsemilla_config_2.clone());
 
+        /// 返回所有设置
         Config {
             primary,
             q_orchard,
@@ -289,18 +332,22 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         }
     }
 
+    /// 使用以上设置的电路加载方法
     #[allow(non_snake_case)]
     fn synthesize(
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<pallas::Base>,
     ) -> Result<(), plonk::Error> {
+        /// 使用config_1加载一个Sinsemilla子电路
         // Load the Sinsemilla generator lookup table used by the whole circuit.
         SinsemillaChip::load(config.sinsemilla_config_1.clone(), &mut layouter)?;
 
+        /// 获得ECC子电路的模板
         // Construct the ECC chip.
         let ecc_chip = config.ecc_chip();
 
+        /// 使用以上两个电路见证以下输入
         // Witness private inputs that are used across multiple checks.
         let (psi_old, rho_old, cm_old, g_d_old, ak_P, nk, v_old, v_new) = {
             // Witness psi_old
@@ -363,6 +410,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             (psi_old, rho_old, cm_old, g_d_old, ak_P, nk, v_old, v_new)
         };
 
+        /// 验证计算旧note的Merkle root
         // Merkle path validity check (https://p.z.cash/ZKS:action-merkle-path-validity?partial).
         let root = {
             let path = self
@@ -378,8 +426,10 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             merkle_inputs.calculate_root(layouter.namespace(|| "Merkle path"), leaf)?
         };
 
+        /// 处理value commitment
         // Value commitment integrity (https://p.z.cash/ZKS:action-cv-net-integrity?partial).
         let v_net_magnitude_sign = {
+            /// 获得v_old - v_new这一结果的符号和数量
             // Witness the magnitude and sign of v_net = v_old - v_new
             let v_net_magnitude_sign = {
                 let v_net = self.v_old - self.v_new;
@@ -410,6 +460,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 (magnitude, sign)
             };
 
+            /// 使用v_net和rcv计算value commitment cv_net
             let v_net = ScalarFixedShort::new(
                 ecc_chip.clone(),
                 layouter.namespace(|| "v_net"),
@@ -428,6 +479,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 rcv,
             )?;
 
+            /// 验证计算出的cv_net等于公共输入
             // Constrain cv_net to equal public input
             layouter.constrain_instance(cv_net.inner().x().cell(), config.primary, CV_NET_X)?;
             layouter.constrain_instance(cv_net.inner().y().cell(), config.primary, CV_NET_Y)?;
@@ -436,6 +488,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             v_net_magnitude_sign
         };
 
+        /// 计算旧note的nullifier
         // Nullifier integrity (https://p.z.cash/ZKS:action-nullifier-integrity).
         let nf_old = {
             let nf_old = gadget::derive_nullifier(
@@ -455,6 +508,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             nf_old
         };
 
+        /// 计算rk = [alpha] SpendAuthG + ak_P
         // Spend authority (https://p.z.cash/ZKS:action-spend-authority)
         {
             let alpha =
@@ -475,6 +529,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             layouter.constrain_instance(rk.inner().y().cell(), config.primary, RK_Y)?;
         }
 
+        /// 计算验证pk_d_old
         // Diversified address integrity (https://p.z.cash/ZKS:action-addr-integrity?partial).
         let pk_d_old = {
             let ivk = {
@@ -521,6 +576,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             pk_d_old
         };
 
+        /// 验证计算cm_old
         // Old note commitment integrity (https://p.z.cash/ZKS:action-cm-old-integrity?partial).
         {
             let rcm_old = ScalarFixed::new(
@@ -549,6 +605,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             derived_cm_old.constrain_equal(layouter.namespace(|| "cm_old equality"), &cm_old)?;
         }
 
+        /// 验证计算cm_new
         // New note commitment integrity (https://p.z.cash/ZKS:action-cmx-new-integrity?partial).
         {
             // Witness g_d_new
@@ -609,6 +666,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             layouter.constrain_instance(cmx.inner().cell(), config.primary, CMX)?;
         }
 
+        /// 验证设置过程中定义的基础约束
         // Constrain the remaining Orchard circuit checks.
         layouter.assign_region(
             || "Orchard circuit checks",
@@ -661,12 +719,6 @@ impl plonk::Circuit<pallas::Base> for Circuit {
     }
 }
 ```
-
-这里定义的`Circuit`不再是一个Action的附属方法，而是一个包含上下文的类。真正的电路实现实际是`plonk::Circuit<pallas::Base>`。
-
-> Halo2相比于Halo的最大区别是，用Plonk中的效率更优的Polynomial IOP方案替换了Sonic中的Polynomial IOP。即Halo中使用Sonic方案来验证交易，Halo2中使用Plonk来验证交易。Plonk的效率优于Sonic，Plonk可以更少的gates来表示更复杂的circuit。
-
-(以上是临时回想起来的，放在这里)
 
 曾经作为主体的`Action`现在和`Circuit`分开定义，我们可以在[zcash/orchard/src/action.rs](https://github.com/zcash/orchard/blob/main/src/action.rs)找到下面的代码，
 
@@ -760,20 +812,163 @@ impl<T> Action<T> {
         })
     }
 }
+```
 
-impl DynamicUsage for Action<redpallas::Signature<SpendAuth>> {
-    #[inline(always)]
-    fn dynamic_usage(&self) -> usize {
-        0
+`Action`在此的作用相当于Action Description，也就是公共参数和结果的载体，所以我们将重点回到集成电路`Circuit`，看一看其中使用到的子电路。
+
+#### SinsemillaChip
+
+按照电路加载的逻辑顺序，首先是`SinsemillaChip`，我们可以在[zcash/halo2/halo2_gadgets](https://github.com/zcash/halo2/blob/476980efcdadfd532f769b599a7ea6d05eb5d362/halo2_gadgets/src/sinsemilla/chip.rs)找到它，
+
+```rust
+impl<Hash, Commit, F> SinsemillaChip<Hash, Commit, F>
+where
+    Hash: HashDomains<pallas::Affine>,
+    F: FixedPoints<pallas::Affine>,
+    Commit: CommitDomains<pallas::Affine, F, Hash>,
+{
+    /// Reconstructs this chip from the given config.
+    pub fn construct(config: <Self as Chip<pallas::Base>>::Config) -> Self {
+        Self { config }
     }
 
-    #[inline(always)]
-    fn dynamic_usage_bounds(&self) -> (usize, Option<usize>) {
-        (0, Some(0))
+    /// Loads the lookup table required by this chip into the circuit.
+    pub fn load(
+        config: SinsemillaConfig<Hash, Commit, F>,
+        layouter: &mut impl Layouter<pallas::Base>,
+    ) -> Result<<Self as Chip<pallas::Base>>::Loaded, Error> {
+        // Load the lookup table.
+        config.generator_table.load(layouter)
+    }
+
+    /// # Side-effects
+    ///
+    /// All columns in `advices` and will be equality-enabled.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(non_snake_case)]
+    pub fn configure(
+        meta: &mut ConstraintSystem<pallas::Base>,
+        advices: [Column<Advice>; 5],
+        witness_pieces: Column<Advice>,
+        fixed_y_q: Column<Fixed>,
+        lookup: (TableColumn, TableColumn, TableColumn),
+        range_check: LookupRangeCheckConfig<pallas::Base, { sinsemilla::K }>,
+    ) -> <Self as Chip<pallas::Base>>::Config {
+        // Enable equality on all advice columns
+        for advice in advices.iter() {
+            meta.enable_equality(*advice);
+        }
+
+        let config = SinsemillaConfig::<Hash, Commit, F> {
+            q_sinsemilla1: meta.complex_selector(),
+            q_sinsemilla2: meta.fixed_column(),
+            q_sinsemilla4: meta.selector(),
+            fixed_y_q,
+            double_and_add: DoubleAndAdd {
+                x_a: advices[0],
+                x_p: advices[1],
+                lambda_1: advices[3],
+                lambda_2: advices[4],
+            },
+            bits: advices[2],
+            witness_pieces,
+            generator_table: GeneratorTableConfig {
+                table_idx: lookup.0,
+                table_x: lookup.1,
+                table_y: lookup.2,
+            },
+            lookup_config: range_check,
+            _marker: PhantomData,
+        };
+
+        // Set up lookup argument
+        GeneratorTableConfig::configure(meta, config.clone());
+
+        let two = pallas::Base::from(2);
+
+        // Closures for expressions that are derived multiple times
+        // x_r = lambda_1^2 - x_a - x_p
+        let x_r = |meta: &mut VirtualCells<pallas::Base>, rotation| {
+            config.double_and_add.x_r(meta, rotation)
+        };
+
+        // Y_A = (lambda_1 + lambda_2) * (x_a - x_r)
+        let Y_A = |meta: &mut VirtualCells<pallas::Base>, rotation| {
+            config.double_and_add.Y_A(meta, rotation)
+        };
+
+        // Check that the initial x_A, x_P, lambda_1, lambda_2 are consistent with y_Q.
+        // https://p.z.cash/halo2-0.1:sinsemilla-constraints?partial
+        meta.create_gate("Initial y_Q", |meta| {
+            let q_s4 = meta.query_selector(config.q_sinsemilla4);
+            let y_q = meta.query_fixed(config.fixed_y_q);
+
+            // Y_A = (lambda_1 + lambda_2) * (x_a - x_r)
+            let Y_A_cur = Y_A(meta, Rotation::cur());
+
+            // 2 * y_q - Y_{A,0} = 0
+            let init_y_q_check = y_q * two - Y_A_cur;
+
+            Constraints::with_selector(q_s4, Some(("init_y_q_check", init_y_q_check)))
+        });
+
+        // https://p.z.cash/halo2-0.1:sinsemilla-constraints?partial
+        meta.create_gate("Sinsemilla gate", |meta| {
+            let q_s1 = meta.query_selector(config.q_sinsemilla1);
+            let q_s3 = config.q_s3(meta);
+
+            let lambda_1_next = meta.query_advice(config.double_and_add.lambda_1, Rotation::next());
+            let lambda_2_cur = meta.query_advice(config.double_and_add.lambda_2, Rotation::cur());
+            let x_a_cur = meta.query_advice(config.double_and_add.x_a, Rotation::cur());
+            let x_a_next = meta.query_advice(config.double_and_add.x_a, Rotation::next());
+
+            // x_r = lambda_1^2 - x_a_cur - x_p
+            let x_r = x_r(meta, Rotation::cur());
+
+            // Y_A = (lambda_1 + lambda_2) * (x_a - x_r)
+            let Y_A_cur = Y_A(meta, Rotation::cur());
+
+            // Y_A = (lambda_1 + lambda_2) * (x_a - x_r)
+            let Y_A_next = Y_A(meta, Rotation::next());
+
+            // lambda2^2 - (x_a_next + x_r + x_a_cur) = 0
+            let secant_line =
+                lambda_2_cur.clone().square() - (x_a_next.clone() + x_r + x_a_cur.clone());
+
+            // lhs - rhs = 0, where
+            //    - lhs = 4 * lambda_2_cur * (x_a_cur - x_a_next)
+            //    - rhs = (2 * Y_A_cur + (2 - q_s3) * Y_A_next + 2 * q_s3 * y_a_final)
+            let y_check = {
+                // lhs = 4 * lambda_2_cur * (x_a_cur - x_a_next)
+                let lhs = lambda_2_cur * pallas::Base::from(4) * (x_a_cur - x_a_next);
+
+                // rhs = 2 * Y_A_cur + (2 - q_s3) * Y_A_next + 2 * q_s3 * y_a_final
+                let rhs = {
+                    // y_a_final is assigned to the lambda1 column on the next offset.
+                    let y_a_final = lambda_1_next;
+
+                    Y_A_cur * two
+                        + (Expression::Constant(two) - q_s3.clone()) * Y_A_next
+                        + q_s3 * two * y_a_final
+                };
+                lhs - rhs
+            };
+
+            Constraints::with_selector(q_s1, [("Secant line", secant_line), ("y check", y_check)])
+        });
+
+        config
     }
 }
-
 ```
+
+#### EccChip
+
+### 椭圆曲线
+
+[](https://github.com/zcash/pasta_curves)
+
+### 证明生成
 
 接下来我们可以在[zcash/orchard/src/bundle.rs](https://github.com/zcash/orchard/blob/main/src/bundle.rs)找到生成证明的入口，
 

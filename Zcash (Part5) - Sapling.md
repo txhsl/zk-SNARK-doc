@@ -1111,7 +1111,7 @@ Output电路包含的内容更少，
 
 #### ECC
 
-首先是椭圆曲线的使用，Sprout中Zcash只使用了哈希函数，但是Sapling引入了电路中的Jubjub曲线。不得不提的两个概念就是EdwardsPoint和MontgomeryPoint，
+首先是椭圆曲线的使用，Sprout中Zcash只使用了哈希函数，但是Sapling引入了电路中的Jubjub曲线和相应的曲线运算。不得不提的两个概念就是EdwardsPoint和MontgomeryPoint，
 
 ```rust
 pub struct EdwardsPoint {
@@ -1129,9 +1129,11 @@ pub struct MontgomeryPoint {
 
 > Jubjub is a twisted Edwards curve of the form $-x^2 + y^2 = 1 + d x^2 y^2$ built over the BLS12-381 scalar field, with $d = -(10240/10241)$. Being a twisted Edwards curve, it has a complete addition law that avoids edge cases with doubling and identities, making it convenient to work with inside of an arithmetic circuit.
 
-Jubjub是基于BLS12-381和上述方程的一条扭曲爱德华椭圆曲线（Twisted Edwards Curve），曲线上的点即为`EdwardsPoint`。该种曲线上的加法运算可以避免复杂的边缘情况，从而在电路中进行快速的计算。此外，每一条扭曲爱德华椭圆曲线都和另外某一条蒙哥马利曲线（Montgomery Curve）存在双向有理映射，也就是对于一个有效的`EdwardsPoint`，在对应的蒙哥马利曲线上可以转换得到一个有效的`MontgomeryPoint`。后者被用于Zcash的pedersen hash计算。
+Jubjub是基于BLS12-381和上述方程的一条扭曲爱德华椭圆曲线（Twisted Edwards Curve），曲线上的点即为`EdwardsPoint`。该种曲线上的加法运算可以避免复杂的边缘情况，从而在电路中进行快速的计算。
 
-我们先看一下`EdwardsPoint`包含的电路运算，
+此外，每一条扭曲爱德华椭圆曲线都和另外某一条蒙哥马利曲线（Montgomery Curve）存在双向有理映射，也就是对于一个有效的`EdwardsPoint`，在对应的蒙哥马利曲线上可以转换得到一个有效的`MontgomeryPoint`。后者被用于Zcash的pedersen hash计算。
+
+我们先看一下`EdwardsPoint`和`MontgomeryPoint`包含的电路运算，
 
 ```rust
 impl EdwardsPoint {
@@ -1530,6 +1532,147 @@ impl EdwardsPoint {
         );
 
         Ok(EdwardsPoint { u: u3, v: v3 })
+    }
+}
+
+impl MontgomeryPoint {
+    /// Converts an element in the prime order subgroup into
+    /// a point in the birationally equivalent twisted
+    /// Edwards curve.
+    pub fn into_edwards<CS>(self, mut cs: CS) -> Result<EdwardsPoint, SynthesisError>
+    where
+        CS: ConstraintSystem<bls12_381::Scalar>,
+    {
+        // Compute u = (scale*x) / y
+        let u = AllocatedNum::alloc(cs.namespace(|| "u"), || {
+            let mut t0 = *self.x.get_value().get()?;
+            t0.mul_assign(MONTGOMERY_SCALE);
+
+            let ret = self.y.get_value().get()?.invert().map(|invy| t0 * invy);
+            if bool::from(ret.is_some()) {
+                Ok(ret.unwrap())
+            } else {
+                Err(SynthesisError::DivisionByZero)
+            }
+        })?;
+
+        cs.enforce(
+            || "u computation",
+            |lc| lc + &self.y.lc(bls12_381::Scalar::one()),
+            |lc| lc + u.get_variable(),
+            |lc| lc + &self.x.lc(MONTGOMERY_SCALE),
+        );
+
+        // Compute v = (x - 1) / (x + 1)
+        let v = AllocatedNum::alloc(cs.namespace(|| "v"), || {
+            let mut t0 = *self.x.get_value().get()?;
+            let mut t1 = t0;
+            t0.sub_assign(&bls12_381::Scalar::one());
+            t1.add_assign(&bls12_381::Scalar::one());
+
+            let ret = t1.invert().map(|t1| t0 * t1);
+            if bool::from(ret.is_some()) {
+                Ok(ret.unwrap())
+            } else {
+                Err(SynthesisError::DivisionByZero)
+            }
+        })?;
+
+        let one = CS::one();
+        cs.enforce(
+            || "v computation",
+            |lc| lc + &self.x.lc(bls12_381::Scalar::one()) + one,
+            |lc| lc + v.get_variable(),
+            |lc| lc + &self.x.lc(bls12_381::Scalar::one()) - one,
+        );
+
+        Ok(EdwardsPoint { u, v })
+    }
+
+    /// Interprets an (x, y) pair as a point
+    /// in Montgomery, does not check that it's
+    /// on the curve. Useful for constants and
+    /// window table lookups.
+    pub fn interpret_unchecked(x: Num<bls12_381::Scalar>, y: Num<bls12_381::Scalar>) -> Self {
+        MontgomeryPoint { x, y }
+    }
+
+    /// Performs an affine point addition, not defined for
+    /// points with the same x-coordinate.
+    pub fn add<CS>(&self, mut cs: CS, other: &Self) -> Result<Self, SynthesisError>
+    where
+        CS: ConstraintSystem<bls12_381::Scalar>,
+    {
+        // Compute lambda = (y' - y) / (x' - x)
+        let lambda = AllocatedNum::alloc(cs.namespace(|| "lambda"), || {
+            let mut n = *other.y.get_value().get()?;
+            n.sub_assign(self.y.get_value().get()?);
+
+            let mut d = *other.x.get_value().get()?;
+            d.sub_assign(self.x.get_value().get()?);
+
+            let ret = d.invert().map(|d| n * d);
+            if bool::from(ret.is_some()) {
+                Ok(ret.unwrap())
+            } else {
+                Err(SynthesisError::DivisionByZero)
+            }
+        })?;
+
+        cs.enforce(
+            || "evaluate lambda",
+            |lc| lc + &other.x.lc(bls12_381::Scalar::one()) - &self.x.lc(bls12_381::Scalar::one()),
+            |lc| lc + lambda.get_variable(),
+            |lc| lc + &other.y.lc(bls12_381::Scalar::one()) - &self.y.lc(bls12_381::Scalar::one()),
+        );
+
+        // Compute x'' = lambda^2 - A - x - x'
+        let xprime = AllocatedNum::alloc(cs.namespace(|| "xprime"), || {
+            let mut t0 = lambda.get_value().get()?.square();
+            t0.sub_assign(MONTGOMERY_A);
+            t0.sub_assign(self.x.get_value().get()?);
+            t0.sub_assign(other.x.get_value().get()?);
+
+            Ok(t0)
+        })?;
+
+        // (lambda) * (lambda) = (A + x + x' + x'')
+        let one = CS::one();
+        cs.enforce(
+            || "evaluate xprime",
+            |lc| lc + lambda.get_variable(),
+            |lc| lc + lambda.get_variable(),
+            |lc| {
+                lc + (MONTGOMERY_A, one)
+                    + &self.x.lc(bls12_381::Scalar::one())
+                    + &other.x.lc(bls12_381::Scalar::one())
+                    + xprime.get_variable()
+            },
+        );
+
+        // Compute y' = -(y + lambda(x' - x))
+        let yprime = AllocatedNum::alloc(cs.namespace(|| "yprime"), || {
+            let mut t0 = *xprime.get_value().get()?;
+            t0.sub_assign(self.x.get_value().get()?);
+            t0.mul_assign(lambda.get_value().get()?);
+            t0.add_assign(self.y.get_value().get()?);
+            t0 = t0.neg();
+
+            Ok(t0)
+        })?;
+
+        // y' + y = lambda(x - x')
+        cs.enforce(
+            || "evaluate yprime",
+            |lc| lc + &self.x.lc(bls12_381::Scalar::one()) - xprime.get_variable(),
+            |lc| lc + lambda.get_variable(),
+            |lc| lc + yprime.get_variable() + &self.y.lc(bls12_381::Scalar::one()),
+        );
+
+        Ok(MontgomeryPoint {
+            x: xprime.into(),
+            y: yprime.into(),
+        })
     }
 }
 ```
@@ -1938,7 +2081,7 @@ where
                 &segment_windows[0],
             )?;
 
-            // 转换到MontgomeryPoint
+            // 包装为MontgomeryPoint
             let tmp = MontgomeryPoint::interpret_unchecked(tmp.0, tmp.1);
 
             match segment_result {
@@ -1995,7 +2138,9 @@ where
 }
 ```
 
-这里使用到了[`lookup3_xy_with_conditional_negation`](https://github.com/zkcrypto/bellman/blob/4c1746c9c22f3537a86e5320b4fd6c2354291616/src/gadgets/lookup.rs#L121)，
+一个明显的特点在于电路内的哈希计算包含了一次从`segment_result`到`edwards_result`的变换。这种方法的优势在于，Montgomery域内计算取余的除法操作可以简化成移位运算。相比于直接在Edward域上运算，这让哈希计算变得简单，不论是从算法上还是硬件上，都能让哈希的计算速度变得更快。
+
+这里还使用到了[`lookup3_xy_with_conditional_negation`](https://github.com/zkcrypto/bellman/blob/4c1746c9c22f3537a86e5320b4fd6c2354291616/src/gadgets/lookup.rs#L121)，
 
 ```rust
 /// Performs a 3-bit window table lookup, where

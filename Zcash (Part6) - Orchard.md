@@ -9,6 +9,37 @@
 
 和Sapling稍有不同，Orchard现阶段是zcash/zcash的一个外部调用，我们可以在[zcash/orchard](https://github.com/zcash/orchard)找到它。因此Orchard的调用路线和之前两个协议的“zcash->librustzcash->bellman”调用路线会有明显不同。
 
+### 电路理论
+
+受制于巨大的篇幅和代码量，下面的内容并不能直观解释Orchard电路的不同之处，这里尝试先用一些简单的理论解释其中的原理。
+
+#### 椭圆曲线
+
+在上一部分，我们已经知道Sapling使用了BLS12-381上构建的一条扭曲爱德华椭圆曲线（Twisted Edwards Curve）实现ECC，而Orchard使用了以下两条Pallas和Vesta曲线，
+
+> Pallas: $y^2=x^3+5$ over $GF(0x40000000000000000000000000000000224698fc094cf91b992d30ed00000001)$
+Vesta: $y^2=x^3+5$ over $GF(0x40000000000000000000000000000000224698fc0994a8dd8c46eb2100000001)$
+
+很明显，两条曲线是同一个方程，所以Zcash也称之为[Pasta curves](https://github.com/zcash/pasta_curves)。这条曲线的特殊性在于任意曲线上的阶(order)是另一条曲线上的基域(base field)，也就是可以对结果进行二次甚至循环的计算。详细关于为什么使用两条曲线以及计算方式，可以阅读[这篇](https://www.michaelstraka.com/posts/recursivesnarks/)。
+
+我们知道Sapling中曲线的变换是为了简化哈希的计算，而Pasta curves让证明的折叠变得简单，具体可以参照[这篇博客](https://electriccoin.co/blog/the-pasta-curves-for-halo-2-and-beyond/)。不仅原本Jubjub的性质和Montgomery算法可行性得到保留，曲线上多项式计算的性能也得到大幅提升。
+
+#### Sinsemilla哈希
+
+> SinsemillaHash is an algebraic hash function with collision resistance (for fixed input length) derived from assumed hardness of the Discrete Logarithm Problem. The motivation for introducing a new discrete-logarithm-based hash function (rather than using PedersenHash) is to make efficient use of the lookups available in recent proof systems including Halo 2.
+
+Sinsemilla哈希是一种对于固定长度输入具有抗碰撞性的哈希函数，使用其的目的在于让Halo 2中的lookup操作变得更有效率。
+
+其结果是，Sinsemilla哈希代替Pedersen哈希，被用于note commitment和merkel root的计算，两者并不要求同态的性质。
+
+#### Poseidon哈希
+
+Poseidon最大的特点和优势在于所有运算均在有限域内完成，即均为模运算，针对零知识证明协议做了特定优化，能够够显著降低证明生成的计算复杂度。Poseidon哈希代替BLAKE2s，被用于nullifier的计算。
+
+#### 证明递归
+
+证明的递归(rollup)指的是将上一个证明的结果作为下一个证明的输入，由此实现证明的串联，用最后一个证明的结果前向覆盖之前所有的输入。证明的“串联”并不意味着其生成过程的并行不可行，我们已经了解曲线循环的特性，也知道之前协议证明结果的形式表达，用一句话来说，我们可以先计算出每个单独的证明，然后用循环计算的方法把它们串联起来，一次曲线上的计算就可以串联两个结果。
+
 ### 证明电路
 
 Orchard将证明部分代码划分为Circuit、Chip和Gadget三个大类，其中Chip是新的概念引入，相当于我们理解的子电路，比如JoinSplit的`InputNote`和`OutputNote`。
@@ -1466,8 +1497,6 @@ where
 ```
 
 我们看到ECC芯片的设置又包含了见证点的运算`witness_point`和其他曲线上计算方法`add_incomplete`、`add`、`mul`、`mul_fixed_full`、`mul_fixed_short`、`mul_fixed_base_field`的设置，这些具体的子方法和它们的实现都位于[zcash/halo2/halo2_gadgets/src/ecc/chip](https://github.com/zcash/halo2/tree/41c87eac0f9766dc36af94291ae8537581b1272b/halo2_gadgets/src/ecc/chip)，内容比较多，这里就不贴过多的代码了。
-
-重点需要提及的是Orchard使用的两条曲线[Pallas and Vesta](https://github.com/zcash/pasta_curves)以及它们的特性，这个部分我们放到椭圆曲线一节中介绍。
 
 #### PoseidonChip
 
@@ -3521,16 +3550,1361 @@ pub(in crate::circuit) mod gadgets {
 }
 ```
 
-### 电路理论
+#### Gadgets
 
-受制于巨大的篇幅和代码量，相信上面的内容并不能直观解释Orchard电路的不同之处，这里尝试再用一些简单的理论解释其中的原理。
+以上芯片已经描述了大部分Orchard中所需的电路计算，下面再介绍一些电路上的关键过程，首先是value commitment的计算，位于[zcash/orchard/src/circuit/gadget.rs](https://github.com/zcash/orchard/blob/be69324b9cab8179a61b2b8ee2a51a146665cd8d/src/circuit/gadget.rs)，
 
-#### 椭圆曲线
+```rust
+/// `ValueCommit^Orchard` from [Section 5.4.8.3 Homomorphic Pedersen commitments (Sapling and Orchard)].
+///
+/// [Section 5.4.8.3 Homomorphic Pedersen commitments (Sapling and Orchard)]: https://zips.z.cash/protocol/protocol.pdf#concretehomomorphiccommit
+pub(in crate::circuit) fn value_commit_orchard<
+    EccChip: EccInstructions<
+        pallas::Affine,
+        FixedPoints = OrchardFixedBases,
+        Var = AssignedCell<pallas::Base, pallas::Base>,
+    >,
+>(
+    mut layouter: impl Layouter<pallas::Base>,
+    ecc_chip: EccChip,
+    v: ScalarFixedShort<pallas::Affine, EccChip>,
+    rcv: ScalarFixed<pallas::Affine, EccChip>,
+) -> Result<Point<pallas::Affine, EccChip>, plonk::Error> {
+    // commitment = [v] ValueCommitV
+    let (commitment, _) = {
+        let value_commit_v = ValueCommitV;
+        let value_commit_v = FixedPointShort::from_inner(ecc_chip.clone(), value_commit_v);
+        value_commit_v.mul(layouter.namespace(|| "[v] ValueCommitV"), v)?
+    };
+
+    // blind = [rcv] ValueCommitR
+    let (blind, _rcv) = {
+        let value_commit_r = OrchardFixedBasesFull::ValueCommitR;
+        let value_commit_r = FixedPoint::from_inner(ecc_chip, value_commit_r);
+
+        // [rcv] ValueCommitR
+        value_commit_r.mul(layouter.namespace(|| "[rcv] ValueCommitR"), rcv)?
+    };
+
+    // [v] ValueCommitV + [rcv] ValueCommitR
+    commitment.add(layouter.namespace(|| "cv"), &blind)
+}
+```
+
+然后是nullifier的计算，在同样的位置，
+
+```rust
+/// `DeriveNullifier` from [Section 4.16: Note Commitments and Nullifiers].
+///
+/// [Section 4.16: Note Commitments and Nullifiers]: https://zips.z.cash/protocol/protocol.pdf#commitmentsandnullifiers
+#[allow(clippy::too_many_arguments)]
+pub(in crate::circuit) fn derive_nullifier<
+    PoseidonChip: PoseidonSpongeInstructions<pallas::Base, poseidon::P128Pow5T3, ConstantLength<2>, 3, 2>,
+    AddChip: AddInstruction<pallas::Base>,
+    EccChip: EccInstructions<
+        pallas::Affine,
+        FixedPoints = OrchardFixedBases,
+        Var = AssignedCell<pallas::Base, pallas::Base>,
+    >,
+>(
+    mut layouter: impl Layouter<pallas::Base>,
+    poseidon_chip: PoseidonChip,
+    add_chip: AddChip,
+    ecc_chip: EccChip,
+    rho: AssignedCell<pallas::Base, pallas::Base>,
+    psi: &AssignedCell<pallas::Base, pallas::Base>,
+    cm: &Point<pallas::Affine, EccChip>,
+    nk: AssignedCell<pallas::Base, pallas::Base>,
+) -> Result<X<pallas::Affine, EccChip>, plonk::Error> {
+    // hash = poseidon_hash(nk, rho)
+    let hash = {
+        let poseidon_message = [nk, rho];
+        let poseidon_hasher =
+            PoseidonHash::init(poseidon_chip, layouter.namespace(|| "Poseidon init"))?;
+        poseidon_hasher.hash(
+            layouter.namespace(|| "Poseidon hash (nk, rho)"),
+            poseidon_message,
+        )?
+    };
+
+    // Add hash output to psi.
+    // `scalar` = poseidon_hash(nk, rho) + psi.
+    let scalar = add_chip.add(
+        layouter.namespace(|| "scalar = poseidon_hash(nk, rho) + psi"),
+        &hash,
+        psi,
+    )?;
+
+    // Multiply scalar by NullifierK
+    // `product` = [poseidon_hash(nk, rho) + psi] NullifierK.
+    //
+    let product = {
+        let nullifier_k = FixedPointBaseField::from_inner(ecc_chip, NullifierK);
+        nullifier_k.mul(
+            layouter.namespace(|| "[poseidon_output + psi] NullifierK"),
+            scalar,
+        )?
+    };
+
+    // Add cm to multiplied fixed base to get nf
+    // cm + [poseidon_output + psi] NullifierK
+    cm.add(layouter.namespace(|| "nf"), &product)
+        .map(|res| res.extract_p())
+}
+```
 
 ### 证明生成
 
-接下来我们可以在[zcash/orchard/src/bundle.rs](https://github.com/zcash/orchard/blob/main/src/bundle.rs)找到生成证明的入口，
+接下来我们可以在[zcash/orchard/src/circuit.rs](https://github.com/zcash/orchard/blob/5fbbded49e3162a31fd3bb0de3c344f3cc4dfa60/src/circuit.rs)找到证明的定义，
 
 ```rust
+pub struct Instance {
+    pub(crate) anchor: Anchor,
+    pub(crate) cv_net: ValueCommitment,
+    pub(crate) nf_old: Nullifier,
+    pub(crate) rk: VerificationKey<SpendAuth>,
+    pub(crate) cmx: ExtractedNoteCommitment,
+    pub(crate) enable_spend: bool,
+    pub(crate) enable_output: bool,
+}
 
+impl Proof {
+    /// Creates a proof for the given circuits and instances.
+    pub fn create(
+        pk: &ProvingKey,
+        circuits: &[Circuit],
+        instances: &[Instance],
+        mut rng: impl RngCore,
+    ) -> Result<Self, plonk::Error> {
+        let instances: Vec<_> = instances.iter().map(|i| i.to_halo2_instance()).collect();
+        let instances: Vec<Vec<_>> = instances
+            .iter()
+            .map(|i| i.iter().map(|c| &c[..]).collect())
+            .collect();
+        let instances: Vec<_> = instances.iter().map(|i| &i[..]).collect();
+
+        let mut transcript = Blake2bWrite::<_, vesta::Affine, _>::init(vec![]);
+        plonk::create_proof(
+            &pk.params,
+            &pk.pk,
+            circuits,
+            &instances,
+            &mut rng,
+            &mut transcript,
+        )?;
+        Ok(Proof(transcript.finalize()))
+    }
+
+    /// Verifies this proof with the given instances.
+    pub fn verify(&self, vk: &VerifyingKey, instances: &[Instance]) -> Result<(), plonk::Error> {
+        let instances: Vec<_> = instances.iter().map(|i| i.to_halo2_instance()).collect();
+        let instances: Vec<Vec<_>> = instances
+            .iter()
+            .map(|i| i.iter().map(|c| &c[..]).collect())
+            .collect();
+        let instances: Vec<_> = instances.iter().map(|i| &i[..]).collect();
+
+        let strategy = SingleVerifier::new(&vk.params);
+        let mut transcript = Blake2bRead::init(&self.0[..]);
+        plonk::verify_proof(&vk.params, &vk.vk, strategy, &instances, &mut transcript)
+    }
+
+    /// Adds this proof to the given batch for verification with the given instances.
+    ///
+    /// Use this API if you want more control over how proof batches are processed. If you
+    /// just want to batch-validate Orchard bundles, use [`bundle::BatchValidator`].
+    ///
+    /// [`bundle::BatchValidator`]: crate::bundle::BatchValidator
+    pub fn add_to_batch(&self, batch: &mut BatchVerifier<vesta::Affine>, instances: Vec<Instance>) {
+        let instances = instances
+            .iter()
+            .map(|i| {
+                i.to_halo2_instance()
+                    .into_iter()
+                    .map(|c| c.into_iter().collect())
+                    .collect()
+            })
+            .collect();
+
+        batch.add_proof(instances, self.0.clone());
+    }
+
+    /// Constructs a new Proof value.
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Proof(bytes)
+    }
+}
 ```
+
+可以看到每个`Instance`对应一对可能的销毁和铸造，而`Proof::create`接收一个`Instance`的数组和一个对应的`Circuit`数组。方法最后调用到`plonk`，我们可以在[zcash/halo2/halo2_proofs/src/plonk/prover.rs](https://github.com/zcash/halo2/blob/41c87eac0f9766dc36af94291ae8537581b1272b/halo2_proofs/src/plonk/prover.rs)找到，
+
+```rust
+/// This creates a proof for the provided `circuit` when given the public
+/// parameters `params` and the proving key [`ProvingKey`] that was
+/// generated previously for the same circuit. The provided `instances`
+/// are zero-padded internally.
+pub fn create_proof<
+    C: CurveAffine,
+    E: EncodedChallenge<C>,
+    R: RngCore,
+    T: TranscriptWrite<C, E>,
+    ConcreteCircuit: Circuit<C::Scalar>,
+>(
+    params: &Params<C>,
+    pk: &ProvingKey<C>,
+    circuits: &[ConcreteCircuit],
+    instances: &[&[&[C::Scalar]]],
+    mut rng: R,
+    transcript: &mut T,
+) -> Result<(), Error> {
+    if circuits.len() != instances.len() {
+        return Err(Error::InvalidInstances);
+    }
+
+    for instance in instances.iter() {
+        if instance.len() != pk.vk.cs.num_instance_columns {
+            return Err(Error::InvalidInstances);
+        }
+    }
+
+    // Hash verification key into transcript
+    pk.vk.hash_into(transcript)?;
+
+    let domain = &pk.vk.domain;
+    let mut meta = ConstraintSystem::default();
+    let config = ConcreteCircuit::configure(&mut meta);
+
+    // Selector optimizations cannot be applied here; use the ConstraintSystem
+    // from the verification key.
+    let meta = &pk.vk.cs;
+
+    struct InstanceSingle<C: CurveAffine> {
+        pub instance_values: Vec<Polynomial<C::Scalar, LagrangeCoeff>>,
+        pub instance_polys: Vec<Polynomial<C::Scalar, Coeff>>,
+        pub instance_cosets: Vec<Polynomial<C::Scalar, ExtendedLagrangeCoeff>>,
+    }
+
+    let instance: Vec<InstanceSingle<C>> = instances
+        .iter()
+        .map(|instance| -> Result<InstanceSingle<C>, Error> {
+            let instance_values = instance
+                .iter()
+                .map(|values| {
+                    let mut poly = domain.empty_lagrange();
+                    assert_eq!(poly.len(), params.n as usize);
+                    if values.len() > (poly.len() - (meta.blinding_factors() + 1)) {
+                        return Err(Error::InstanceTooLarge);
+                    }
+                    for (poly, value) in poly.iter_mut().zip(values.iter()) {
+                        *poly = *value;
+                    }
+                    Ok(poly)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let instance_commitments_projective: Vec<_> = instance_values
+                .iter()
+                .map(|poly| params.commit_lagrange(poly, Blind::default()))
+                .collect();
+            let mut instance_commitments =
+                vec![C::identity(); instance_commitments_projective.len()];
+            C::Curve::batch_normalize(&instance_commitments_projective, &mut instance_commitments);
+            let instance_commitments = instance_commitments;
+            drop(instance_commitments_projective);
+
+            for commitment in &instance_commitments {
+                transcript.common_point(*commitment)?;
+            }
+
+            let instance_polys: Vec<_> = instance_values
+                .iter()
+                .map(|poly| {
+                    let lagrange_vec = domain.lagrange_from_vec(poly.to_vec());
+                    domain.lagrange_to_coeff(lagrange_vec)
+                })
+                .collect();
+
+            let instance_cosets: Vec<_> = instance_polys
+                .iter()
+                .map(|poly| domain.coeff_to_extended(poly.clone()))
+                .collect();
+
+            Ok(InstanceSingle {
+                instance_values,
+                instance_polys,
+                instance_cosets,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    struct AdviceSingle<C: CurveAffine> {
+        pub advice_values: Vec<Polynomial<C::Scalar, LagrangeCoeff>>,
+        pub advice_polys: Vec<Polynomial<C::Scalar, Coeff>>,
+        pub advice_cosets: Vec<Polynomial<C::Scalar, ExtendedLagrangeCoeff>>,
+        pub advice_blinds: Vec<Blind<C::Scalar>>,
+    }
+
+    let advice: Vec<AdviceSingle<C>> = circuits
+        .iter()
+        .zip(instances.iter())
+        .map(|(circuit, instances)| -> Result<AdviceSingle<C>, Error> {
+            struct WitnessCollection<'a, F: Field> {
+                k: u32,
+                pub advice: Vec<Polynomial<Assigned<F>, LagrangeCoeff>>,
+                instances: &'a [&'a [F]],
+                usable_rows: RangeTo<usize>,
+                _marker: std::marker::PhantomData<F>,
+            }
+
+            impl<'a, F: Field> Assignment<F> for WitnessCollection<'a, F> {
+                fn enter_region<NR, N>(&mut self, _: N)
+                where
+                    NR: Into<String>,
+                    N: FnOnce() -> NR,
+                {
+                    // Do nothing; we don't care about regions in this context.
+                }
+
+                fn exit_region(&mut self) {
+                    // Do nothing; we don't care about regions in this context.
+                }
+
+                fn enable_selector<A, AR>(
+                    &mut self,
+                    _: A,
+                    _: &Selector,
+                    _: usize,
+                ) -> Result<(), Error>
+                where
+                    A: FnOnce() -> AR,
+                    AR: Into<String>,
+                {
+                    // We only care about advice columns here
+
+                    Ok(())
+                }
+
+                fn query_instance(
+                    &self,
+                    column: Column<Instance>,
+                    row: usize,
+                ) -> Result<Value<F>, Error> {
+                    if !self.usable_rows.contains(&row) {
+                        return Err(Error::not_enough_rows_available(self.k));
+                    }
+
+                    self.instances
+                        .get(column.index())
+                        .and_then(|column| column.get(row))
+                        .map(|v| Value::known(*v))
+                        .ok_or(Error::BoundsFailure)
+                }
+
+                fn assign_advice<V, VR, A, AR>(
+                    &mut self,
+                    _: A,
+                    column: Column<Advice>,
+                    row: usize,
+                    to: V,
+                ) -> Result<(), Error>
+                where
+                    V: FnOnce() -> Value<VR>,
+                    VR: Into<Assigned<F>>,
+                    A: FnOnce() -> AR,
+                    AR: Into<String>,
+                {
+                    if !self.usable_rows.contains(&row) {
+                        return Err(Error::not_enough_rows_available(self.k));
+                    }
+
+                    *self
+                        .advice
+                        .get_mut(column.index())
+                        .and_then(|v| v.get_mut(row))
+                        .ok_or(Error::BoundsFailure)? = to().into_field().assign()?;
+
+                    Ok(())
+                }
+
+                fn assign_fixed<V, VR, A, AR>(
+                    &mut self,
+                    _: A,
+                    _: Column<Fixed>,
+                    _: usize,
+                    _: V,
+                ) -> Result<(), Error>
+                where
+                    V: FnOnce() -> Value<VR>,
+                    VR: Into<Assigned<F>>,
+                    A: FnOnce() -> AR,
+                    AR: Into<String>,
+                {
+                    // We only care about advice columns here
+
+                    Ok(())
+                }
+
+                fn copy(
+                    &mut self,
+                    _: Column<Any>,
+                    _: usize,
+                    _: Column<Any>,
+                    _: usize,
+                ) -> Result<(), Error> {
+                    // We only care about advice columns here
+
+                    Ok(())
+                }
+
+                fn fill_from_row(
+                    &mut self,
+                    _: Column<Fixed>,
+                    _: usize,
+                    _: Value<Assigned<F>>,
+                ) -> Result<(), Error> {
+                    Ok(())
+                }
+
+                fn push_namespace<NR, N>(&mut self, _: N)
+                where
+                    NR: Into<String>,
+                    N: FnOnce() -> NR,
+                {
+                    // Do nothing; we don't care about namespaces in this context.
+                }
+
+                fn pop_namespace(&mut self, _: Option<String>) {
+                    // Do nothing; we don't care about namespaces in this context.
+                }
+            }
+
+            let unusable_rows_start = params.n as usize - (meta.blinding_factors() + 1);
+
+            let mut witness = WitnessCollection {
+                k: params.k,
+                advice: vec![domain.empty_lagrange_assigned(); meta.num_advice_columns],
+                instances,
+                // The prover will not be allowed to assign values to advice
+                // cells that exist within inactive rows, which include some
+                // number of blinding factors and an extra row for use in the
+                // permutation argument.
+                usable_rows: ..unusable_rows_start,
+                _marker: std::marker::PhantomData,
+            };
+
+            // Synthesize the circuit to obtain the witness and other information.
+            ConcreteCircuit::FloorPlanner::synthesize(
+                &mut witness,
+                circuit,
+                config.clone(),
+                meta.constants.clone(),
+            )?;
+
+            let mut advice = batch_invert_assigned(witness.advice);
+
+            // Add blinding factors to advice columns
+            for advice in &mut advice {
+                for cell in &mut advice[unusable_rows_start..] {
+                    *cell = C::Scalar::random(&mut rng);
+                }
+            }
+
+            // Compute commitments to advice column polynomials
+            let advice_blinds: Vec<_> = advice
+                .iter()
+                .map(|_| Blind(C::Scalar::random(&mut rng)))
+                .collect();
+            let advice_commitments_projective: Vec<_> = advice
+                .iter()
+                .zip(advice_blinds.iter())
+                .map(|(poly, blind)| params.commit_lagrange(poly, *blind))
+                .collect();
+            let mut advice_commitments = vec![C::identity(); advice_commitments_projective.len()];
+            C::Curve::batch_normalize(&advice_commitments_projective, &mut advice_commitments);
+            let advice_commitments = advice_commitments;
+            drop(advice_commitments_projective);
+
+            for commitment in &advice_commitments {
+                transcript.write_point(*commitment)?;
+            }
+
+            let advice_polys: Vec<_> = advice
+                .clone()
+                .into_iter()
+                .map(|poly| domain.lagrange_to_coeff(poly))
+                .collect();
+
+            let advice_cosets: Vec<_> = advice_polys
+                .iter()
+                .map(|poly| domain.coeff_to_extended(poly.clone()))
+                .collect();
+
+            Ok(AdviceSingle {
+                advice_values: advice,
+                advice_polys,
+                advice_cosets,
+                advice_blinds,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Create polynomial evaluator context for values.
+    let mut value_evaluator = poly::new_evaluator(|| {});
+
+    // Register fixed values with the polynomial evaluator.
+    let fixed_values: Vec<_> = pk
+        .fixed_values
+        .iter()
+        .map(|poly| value_evaluator.register_poly(poly.clone()))
+        .collect();
+
+    // Register advice values with the polynomial evaluator.
+    let advice_values: Vec<_> = advice
+        .iter()
+        .map(|advice| {
+            advice
+                .advice_values
+                .iter()
+                .map(|poly| value_evaluator.register_poly(poly.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    // Register instance values with the polynomial evaluator.
+    let instance_values: Vec<_> = instance
+        .iter()
+        .map(|instance| {
+            instance
+                .instance_values
+                .iter()
+                .map(|poly| value_evaluator.register_poly(poly.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    // Create polynomial evaluator context for cosets.
+    let mut coset_evaluator = poly::new_evaluator(|| {});
+
+    // Register fixed cosets with the polynomial evaluator.
+    let fixed_cosets: Vec<_> = pk
+        .fixed_cosets
+        .iter()
+        .map(|poly| coset_evaluator.register_poly(poly.clone()))
+        .collect();
+
+    // Register advice cosets with the polynomial evaluator.
+    let advice_cosets: Vec<_> = advice
+        .iter()
+        .map(|advice| {
+            advice
+                .advice_cosets
+                .iter()
+                .map(|poly| coset_evaluator.register_poly(poly.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    // Register instance cosets with the polynomial evaluator.
+    let instance_cosets: Vec<_> = instance
+        .iter()
+        .map(|instance| {
+            instance
+                .instance_cosets
+                .iter()
+                .map(|poly| coset_evaluator.register_poly(poly.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    // Register permutation cosets with the polynomial evaluator.
+    let permutation_cosets: Vec<_> = pk
+        .permutation
+        .cosets
+        .iter()
+        .map(|poly| coset_evaluator.register_poly(poly.clone()))
+        .collect();
+
+    // Register boundary polynomials used in the lookup and permutation arguments.
+    let l0 = coset_evaluator.register_poly(pk.l0.clone());
+    let l_blind = coset_evaluator.register_poly(pk.l_blind.clone());
+    let l_last = coset_evaluator.register_poly(pk.l_last.clone());
+
+    // Sample theta challenge for keeping lookup columns linearly independent
+    let theta: ChallengeTheta<_> = transcript.squeeze_challenge_scalar();
+
+    let lookups: Vec<Vec<lookup::prover::Permuted<C, _>>> = instance_values
+        .iter()
+        .zip(instance_cosets.iter())
+        .zip(advice_values.iter())
+        .zip(advice_cosets.iter())
+        .map(|(((instance_values, instance_cosets), advice_values), advice_cosets)| -> Result<Vec<_>, Error> {
+            // Construct and commit to permuted values for each lookup
+            pk.vk
+                .cs
+                .lookups
+                .iter()
+                .map(|lookup| {
+                    lookup.commit_permuted(
+                        pk,
+                        params,
+                        domain,
+                        &value_evaluator,
+                        &mut coset_evaluator,
+                        theta,
+                        advice_values,
+                        &fixed_values,
+                        instance_values,
+                        advice_cosets,
+                        &fixed_cosets,
+                        instance_cosets,
+                        &mut rng,
+                        transcript,
+                    )
+                })
+                .collect()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Sample beta challenge
+    let beta: ChallengeBeta<_> = transcript.squeeze_challenge_scalar();
+
+    // Sample gamma challenge
+    let gamma: ChallengeGamma<_> = transcript.squeeze_challenge_scalar();
+
+    // Commit to permutations.
+    let permutations: Vec<permutation::prover::Committed<C, _>> = instance
+        .iter()
+        .zip(advice.iter())
+        .map(|(instance, advice)| {
+            pk.vk.cs.permutation.commit(
+                params,
+                pk,
+                &pk.permutation,
+                &advice.advice_values,
+                &pk.fixed_values,
+                &instance.instance_values,
+                beta,
+                gamma,
+                &mut coset_evaluator,
+                &mut rng,
+                transcript,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let lookups: Vec<Vec<lookup::prover::Committed<C, _>>> = lookups
+        .into_iter()
+        .map(|lookups| -> Result<Vec<_>, _> {
+            // Construct and commit to products for each lookup
+            lookups
+                .into_iter()
+                .map(|lookup| {
+                    lookup.commit_product(
+                        pk,
+                        params,
+                        beta,
+                        gamma,
+                        &mut coset_evaluator,
+                        &mut rng,
+                        transcript,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Commit to the vanishing argument's random polynomial for blinding h(x_3)
+    let vanishing = vanishing::Argument::commit(params, domain, &mut rng, transcript)?;
+
+    // Obtain challenge for keeping all separate gates linearly independent
+    let y: ChallengeY<_> = transcript.squeeze_challenge_scalar();
+
+    // Evaluate the h(X) polynomial's constraint system expressions for the permutation constraints.
+    let (permutations, permutation_expressions): (Vec<_>, Vec<_>) = permutations
+        .into_iter()
+        .zip(advice_cosets.iter())
+        .zip(instance_cosets.iter())
+        .map(|((permutation, advice), instance)| {
+            permutation.construct(
+                pk,
+                &pk.vk.cs.permutation,
+                advice,
+                &fixed_cosets,
+                instance,
+                &permutation_cosets,
+                l0,
+                l_blind,
+                l_last,
+                beta,
+                gamma,
+            )
+        })
+        .unzip();
+
+    let (lookups, lookup_expressions): (Vec<Vec<_>>, Vec<Vec<_>>) = lookups
+        .into_iter()
+        .map(|lookups| {
+            // Evaluate the h(X) polynomial's constraint system expressions for the lookup constraints, if any.
+            lookups
+                .into_iter()
+                .map(|p| p.construct(beta, gamma, l0, l_blind, l_last))
+                .unzip()
+        })
+        .unzip();
+
+    let expressions = advice_cosets
+        .iter()
+        .zip(instance_cosets.iter())
+        .zip(permutation_expressions.into_iter())
+        .zip(lookup_expressions.into_iter())
+        .flat_map(
+            |(((advice_cosets, instance_cosets), permutation_expressions), lookup_expressions)| {
+                let fixed_cosets = &fixed_cosets;
+                iter::empty()
+                    // Custom constraints
+                    .chain(meta.gates.iter().flat_map(move |gate| {
+                        gate.polynomials().iter().map(move |expr| {
+                            expr.evaluate(
+                                &poly::Ast::ConstantTerm,
+                                &|_| panic!("virtual selectors are removed during optimization"),
+                                &|query| {
+                                    fixed_cosets[query.column_index]
+                                        .with_rotation(query.rotation)
+                                        .into()
+                                },
+                                &|query| {
+                                    advice_cosets[query.column_index]
+                                        .with_rotation(query.rotation)
+                                        .into()
+                                },
+                                &|query| {
+                                    instance_cosets[query.column_index]
+                                        .with_rotation(query.rotation)
+                                        .into()
+                                },
+                                &|a| -a,
+                                &|a, b| a + b,
+                                &|a, b| a * b,
+                                &|a, scalar| a * scalar,
+                            )
+                        })
+                    }))
+                    // Permutation constraints, if any.
+                    .chain(permutation_expressions.into_iter())
+                    // Lookup constraints, if any.
+                    .chain(lookup_expressions.into_iter().flatten())
+            },
+        );
+
+    // Construct the vanishing argument's h(X) commitments
+    let vanishing = vanishing.construct(
+        params,
+        domain,
+        coset_evaluator,
+        expressions,
+        y,
+        &mut rng,
+        transcript,
+    )?;
+
+    let x: ChallengeX<_> = transcript.squeeze_challenge_scalar();
+    let xn = x.pow(&[params.n, 0, 0, 0]);
+
+    // Compute and hash instance evals for each circuit instance
+    for instance in instance.iter() {
+        // Evaluate polynomials at omega^i x
+        let instance_evals: Vec<_> = meta
+            .instance_queries
+            .iter()
+            .map(|&(column, at)| {
+                eval_polynomial(
+                    &instance.instance_polys[column.index()],
+                    domain.rotate_omega(*x, at),
+                )
+            })
+            .collect();
+
+        // Hash each instance column evaluation
+        for eval in instance_evals.iter() {
+            transcript.write_scalar(*eval)?;
+        }
+    }
+
+    // Compute and hash advice evals for each circuit instance
+    for advice in advice.iter() {
+        // Evaluate polynomials at omega^i x
+        let advice_evals: Vec<_> = meta
+            .advice_queries
+            .iter()
+            .map(|&(column, at)| {
+                eval_polynomial(
+                    &advice.advice_polys[column.index()],
+                    domain.rotate_omega(*x, at),
+                )
+            })
+            .collect();
+
+        // Hash each advice column evaluation
+        for eval in advice_evals.iter() {
+            transcript.write_scalar(*eval)?;
+        }
+    }
+
+    // Compute and hash fixed evals (shared across all circuit instances)
+    let fixed_evals: Vec<_> = meta
+        .fixed_queries
+        .iter()
+        .map(|&(column, at)| {
+            eval_polynomial(&pk.fixed_polys[column.index()], domain.rotate_omega(*x, at))
+        })
+        .collect();
+
+    // Hash each fixed column evaluation
+    for eval in fixed_evals.iter() {
+        transcript.write_scalar(*eval)?;
+    }
+
+    let vanishing = vanishing.evaluate(x, xn, domain, transcript)?;
+
+    // Evaluate common permutation data
+    pk.permutation.evaluate(x, transcript)?;
+
+    // Evaluate the permutations, if any, at omega^i x.
+    let permutations: Vec<permutation::prover::Evaluated<C>> = permutations
+        .into_iter()
+        .map(|permutation| -> Result<_, _> { permutation.evaluate(pk, x, transcript) })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Evaluate the lookups, if any, at omega^i x.
+    let lookups: Vec<Vec<lookup::prover::Evaluated<C>>> = lookups
+        .into_iter()
+        .map(|lookups| -> Result<Vec<_>, _> {
+            lookups
+                .into_iter()
+                .map(|p| p.evaluate(pk, x, transcript))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let instances = instance
+        .iter()
+        .zip(advice.iter())
+        .zip(permutations.iter())
+        .zip(lookups.iter())
+        .flat_map(|(((instance, advice), permutation), lookups)| {
+            iter::empty()
+                .chain(
+                    pk.vk
+                        .cs
+                        .instance_queries
+                        .iter()
+                        .map(move |&(column, at)| ProverQuery {
+                            point: domain.rotate_omega(*x, at),
+                            poly: &instance.instance_polys[column.index()],
+                            blind: Blind::default(),
+                        }),
+                )
+                .chain(
+                    pk.vk
+                        .cs
+                        .advice_queries
+                        .iter()
+                        .map(move |&(column, at)| ProverQuery {
+                            point: domain.rotate_omega(*x, at),
+                            poly: &advice.advice_polys[column.index()],
+                            blind: advice.advice_blinds[column.index()],
+                        }),
+                )
+                .chain(permutation.open(pk, x))
+                .chain(lookups.iter().flat_map(move |p| p.open(pk, x)).into_iter())
+        })
+        .chain(
+            pk.vk
+                .cs
+                .fixed_queries
+                .iter()
+                .map(|&(column, at)| ProverQuery {
+                    point: domain.rotate_omega(*x, at),
+                    poly: &pk.fixed_polys[column.index()],
+                    blind: Blind::default(),
+                }),
+        )
+        .chain(pk.permutation.open(x))
+        // We query the h(X) polynomial at x
+        .chain(vanishing.open(x));
+
+    multiopen::create_proof(params, rng, transcript, instances).map_err(|_| Error::Opening)
+}
+```
+
+向下继续调用到[zcash/halo2/halo2_proofs/src/poly/multiopen/prover.rs](https://github.com/zcash/halo2/blob/41c87eac0f9766dc36af94291ae8537581b1272b/halo2_proofs/src/poly/multiopen/prover.rs)，
+
+```rust
+/// Create a multi-opening proof
+pub fn create_proof<
+    'a,
+    I,
+    C: CurveAffine,
+    E: EncodedChallenge<C>,
+    R: RngCore,
+    T: TranscriptWrite<C, E>,
+>(
+    params: &Params<C>,
+    mut rng: R,
+    transcript: &mut T,
+    queries: I,
+) -> io::Result<()>
+where
+    I: IntoIterator<Item = ProverQuery<'a, C>> + Clone,
+{
+    let x_1: ChallengeX1<_> = transcript.squeeze_challenge_scalar();
+    let x_2: ChallengeX2<_> = transcript.squeeze_challenge_scalar();
+
+    let (poly_map, point_sets) = construct_intermediate_sets(queries);
+
+    // Collapse openings at same point sets together into single openings using
+    // x_1 challenge.
+    let mut q_polys: Vec<Option<Polynomial<C::Scalar, Coeff>>> = vec![None; point_sets.len()];
+    let mut q_blinds = vec![Blind(C::Scalar::ZERO); point_sets.len()];
+
+    {
+        let mut accumulate =
+            |set_idx: usize, new_poly: &Polynomial<C::Scalar, Coeff>, blind: Blind<C::Scalar>| {
+                if let Some(poly) = &q_polys[set_idx] {
+                    q_polys[set_idx] = Some(poly.clone() * *x_1 + new_poly);
+                } else {
+                    q_polys[set_idx] = Some(new_poly.clone());
+                }
+                q_blinds[set_idx] *= *x_1;
+                q_blinds[set_idx] += blind;
+            };
+
+        for commitment_data in poly_map.into_iter() {
+            accumulate(
+                commitment_data.set_index,        // set_idx,
+                commitment_data.commitment.poly,  // poly,
+                commitment_data.commitment.blind, // blind,
+            );
+        }
+    }
+
+    let q_prime_poly = point_sets
+        .iter()
+        .zip(q_polys.iter())
+        .fold(None, |q_prime_poly, (points, poly)| {
+            let mut poly = points
+                .iter()
+                .fold(poly.clone().unwrap().values, |poly, point| {
+                    kate_division(&poly, *point)
+                });
+            poly.resize(params.n as usize, C::Scalar::ZERO);
+            let poly = Polynomial {
+                values: poly,
+                _marker: PhantomData,
+            };
+
+            if q_prime_poly.is_none() {
+                Some(poly)
+            } else {
+                q_prime_poly.map(|q_prime_poly| q_prime_poly * *x_2 + &poly)
+            }
+        })
+        .unwrap();
+
+    let q_prime_blind = Blind(C::Scalar::random(&mut rng));
+    let q_prime_commitment = params.commit(&q_prime_poly, q_prime_blind).to_affine();
+
+    transcript.write_point(q_prime_commitment)?;
+
+    let x_3: ChallengeX3<_> = transcript.squeeze_challenge_scalar();
+
+    // Prover sends u_i for all i, which correspond to the evaluation
+    // of each Q polynomial commitment at x_3.
+    for q_i_poly in &q_polys {
+        transcript.write_scalar(eval_polynomial(q_i_poly.as_ref().unwrap(), *x_3))?;
+    }
+
+    let x_4: ChallengeX4<_> = transcript.squeeze_challenge_scalar();
+
+    let (p_poly, p_poly_blind) = q_polys.into_iter().zip(q_blinds.into_iter()).fold(
+        (q_prime_poly, q_prime_blind),
+        |(q_prime_poly, q_prime_blind), (poly, blind)| {
+            (
+                q_prime_poly * *x_4 + &poly.unwrap(),
+                Blind((q_prime_blind.0 * &(*x_4)) + &blind.0),
+            )
+        },
+    );
+
+    commitment::create_proof(params, rng, transcript, &p_poly, p_poly_blind, *x_3)
+}
+```
+
+再调用到[zcash/halo2/halo2_proofs/src/poly/commitment/prover.rs](https://github.com/zcash/halo2/blob/41c87eac0f9766dc36af94291ae8537581b1272b/halo2_proofs/src/poly/commitment/prover.rs)，
+
+```rust
+/// Create a polynomial commitment opening proof for the polynomial defined
+/// by the coefficients `px`, the blinding factor `blind` used for the
+/// polynomial commitment, and the point `x` that the polynomial is
+/// evaluated at.
+///
+/// This function will panic if the provided polynomial is too large with
+/// respect to the polynomial commitment parameters.
+///
+/// **Important:** This function assumes that the provided `transcript` has
+/// already seen the common inputs: the polynomial commitment P, the claimed
+/// opening v, and the point x. It's probably also nice for the transcript
+/// to have seen the elliptic curve description and the URS, if you want to
+/// be rigorous.
+pub fn create_proof<
+    C: CurveAffine,
+    E: EncodedChallenge<C>,
+    R: RngCore,
+    T: TranscriptWrite<C, E>,
+>(
+    params: &Params<C>,
+    mut rng: R,
+    transcript: &mut T,
+    p_poly: &Polynomial<C::Scalar, Coeff>,
+    p_blind: Blind<C::Scalar>,
+    x_3: C::Scalar,
+) -> io::Result<()> {
+    // We're limited to polynomials of degree n - 1.
+    assert_eq!(p_poly.len(), params.n as usize);
+
+    // Sample a random polynomial (of same degree) that has a root at x_3, first
+    // by setting all coefficients to random values.
+    let mut s_poly = (*p_poly).clone();
+    for coeff in s_poly.iter_mut() {
+        *coeff = C::Scalar::random(&mut rng);
+    }
+    // Evaluate the random polynomial at x_3
+    let s_at_x3 = eval_polynomial(&s_poly[..], x_3);
+    // Subtract constant coefficient to get a random polynomial with a root at x_3
+    s_poly[0] -= &s_at_x3;
+    // And sample a random blind
+    let s_poly_blind = Blind(C::Scalar::random(&mut rng));
+
+    // Write a commitment to the random polynomial to the transcript
+    let s_poly_commitment = params.commit(&s_poly, s_poly_blind).to_affine();
+    transcript.write_point(s_poly_commitment)?;
+
+    // Challenge that will ensure that the prover cannot change P but can only
+    // witness a random polynomial commitment that agrees with P at x_3, with high
+    // probability.
+    let xi = *transcript.squeeze_challenge_scalar::<()>();
+
+    // Challenge that ensures that the prover did not interfere with the U term
+    // in their commitments.
+    let z = *transcript.squeeze_challenge_scalar::<()>();
+
+    // We'll be opening `P' = P - [v] G_0 + [ξ] S` to ensure it has a root at
+    // zero.
+    let mut p_prime_poly = s_poly * xi + p_poly;
+    let v = eval_polynomial(&p_prime_poly, x_3);
+    p_prime_poly[0] -= &v;
+    let p_prime_blind = s_poly_blind * Blind(xi) + p_blind;
+
+    // This accumulates the synthetic blinding factor `f` starting
+    // with the blinding factor for `P'`.
+    let mut f = p_prime_blind.0;
+
+    // Initialize the vector `p_prime` as the coefficients of the polynomial.
+    let mut p_prime = p_prime_poly.values;
+    assert_eq!(p_prime.len(), params.n as usize);
+
+    // Initialize the vector `b` as the powers of `x_3`. The inner product of
+    // `p_prime` and `b` is the evaluation of the polynomial at `x_3`.
+    let mut b = Vec::with_capacity(1 << params.k);
+    {
+        let mut cur = C::Scalar::ONE;
+        for _ in 0..(1 << params.k) {
+            b.push(cur);
+            cur *= &x_3;
+        }
+    }
+
+    // Initialize the vector `G'` from the URS. We'll be progressively collapsing
+    // this vector into smaller and smaller vectors until it is of length 1.
+    let mut g_prime = params.g.clone();
+
+    // Perform the inner product argument, round by round.
+    for j in 0..params.k {
+        let half = 1 << (params.k - j - 1); // half the length of `p_prime`, `b`, `G'`
+
+        // Compute L, R
+        //
+        // TODO: If we modify multiexp to take "extra" bases, we could speed
+        // this piece up a bit by combining the multiexps.
+        let l_j = best_multiexp(&p_prime[half..], &g_prime[0..half]);
+        let r_j = best_multiexp(&p_prime[0..half], &g_prime[half..]);
+        let value_l_j = compute_inner_product(&p_prime[half..], &b[0..half]);
+        let value_r_j = compute_inner_product(&p_prime[0..half], &b[half..]);
+        let l_j_randomness = C::Scalar::random(&mut rng);
+        let r_j_randomness = C::Scalar::random(&mut rng);
+        let l_j = l_j + &best_multiexp(&[value_l_j * &z, l_j_randomness], &[params.u, params.w]);
+        let r_j = r_j + &best_multiexp(&[value_r_j * &z, r_j_randomness], &[params.u, params.w]);
+        let l_j = l_j.to_affine();
+        let r_j = r_j.to_affine();
+
+        // Feed L and R into the real transcript
+        transcript.write_point(l_j)?;
+        transcript.write_point(r_j)?;
+
+        let u_j = *transcript.squeeze_challenge_scalar::<()>();
+        let u_j_inv = u_j.invert().unwrap(); // TODO, bubble this up
+
+        // Collapse `p_prime` and `b`.
+        // TODO: parallelize
+        #[allow(clippy::assign_op_pattern)]
+        for i in 0..half {
+            p_prime[i] = p_prime[i] + &(p_prime[i + half] * &u_j_inv);
+            b[i] = b[i] + &(b[i + half] * &u_j);
+        }
+        p_prime.truncate(half);
+        b.truncate(half);
+
+        // Collapse `G'`
+        parallel_generator_collapse(&mut g_prime, u_j);
+        g_prime.truncate(half);
+
+        // Update randomness (the synthetic blinding factor at the end)
+        f += &(l_j_randomness * &u_j_inv);
+        f += &(r_j_randomness * &u_j);
+    }
+
+    // We have fully collapsed `p_prime`, `b`, `G'`
+    assert_eq!(p_prime.len(), 1);
+    let c = p_prime[0];
+
+    transcript.write_scalar(c)?;
+    transcript.write_scalar(f)?;
+
+    Ok(())
+}
+```
+
+## 交易构建
+
+### 交易结构
+
+为了保证协议之间的兼容性，Orchard和其他协议仍然共享同一个交易结构，我们回到`CTransaction`，Orchard只为这个结构新增了一个`OrchardBundle`，
+
+```cpp
+class CTransaction
+{
+private:
+    // ......
+    OrchardBundle orchardBundle;
+protected:
+    // ......
+public:
+    // ......
+}
+```
+
+### 构建过程
+
+Orchard协议仍然使用之前的交易构建入口[TransactionBuilder::Build()](https://github.com/zcash/zcash/blob/3cec519ce498133e4bc88d59a9b704a3dc3b1977/src/transaction_builder.cpp#L483)，下面选取一部分，
+
+```cpp
+TransactionBuilderResult TransactionBuilder::Build()
+{
+    // ......
+
+    //
+    // Orchard
+    //
+
+    std::optional<orchard::UnauthorizedBundle> orchardBundle;
+    if (orchardBuilder.has_value() && orchardBuilder->HasActions()) {
+        auto bundle = orchardBuilder->Build();
+        if (bundle.has_value()) {
+            orchardBundle = std::move(bundle);
+        } else {
+            return TransactionBuilderResult("Failed to build Orchard bundle");
+        }
+    }
+
+    //
+    // Signatures
+    //
+
+    auto consensusBranchId = CurrentEpochBranchId(nHeight, consensusParams);
+
+    // Empty output script.
+    uint256 dataToBeSigned;
+    try {
+        if (orchardBundle.has_value()) {
+            // Orchard is only usable with v5+ transactions.
+            dataToBeSigned = ProduceZip244SignatureHash(mtx, tIns, orchardBundle.value());
+        } else {
+            CScript scriptCode;
+            const PrecomputedTransactionData txdata(mtx, tIns);
+            dataToBeSigned = SignatureHash(scriptCode, mtx, NOT_AN_INPUT, SIGHASH_ALL, 0, consensusBranchId, txdata);
+        }
+    } catch (std::ios_base::failure ex) {
+        return TransactionBuilderResult("Could not construct signature hash: " + std::string(ex.what()));
+    } catch (std::logic_error ex) {
+        return TransactionBuilderResult("Could not construct signature hash: " + std::string(ex.what()));
+    }
+
+    if (orchardBundle.has_value()) {
+        auto authorizedBundle = orchardBundle.value().ProveAndSign(
+            orchardSpendingKeys, dataToBeSigned);
+        if (authorizedBundle.has_value()) {
+            mtx.orchardBundle = authorizedBundle.value();
+        } else {
+            return TransactionBuilderResult("Failed to create Orchard proof or signatures");
+        }
+    }
+
+    // ......
+
+    return TransactionBuilderResult(CTransaction(mtx));
+}
+```
+
+这里的bundle生成直接调用到`orchardBuilder->Build()`，再调用到外部，
+
+```rust
+std::optional<UnauthorizedBundle> Builder::Build() {
+    if (!inner) {
+        throw std::logic_error("orchard::Builder has already been used");
+    }
+
+    auto bundle = orchard_builder_build(inner.release());
+    if (bundle == nullptr) {
+        return std::nullopt;
+    } else {
+        return UnauthorizedBundle(bundle);
+    }
+}
+```
+
+签名使用如下名为`Zip244`的匿名签名算法，也调用到了外部，
+
+```cpp
+uint256 ProduceZip244SignatureHash(
+    const CTransaction& tx,
+    const std::vector<CTxOut>& allPrevOutputs,
+    const orchard::UnauthorizedBundle& orchardBundle)
+{
+    uint256 dataToBeSigned;
+    PrecomputedTransactionData local(tx, allPrevOutputs);
+    if (!zcash_builder_zip244_shielded_signature_digest(
+        local.preTx.release(),
+        orchardBundle.inner.get(),
+        dataToBeSigned.begin()))
+    {
+        throw std::logic_error("ZIP 225 signature hash failed");
+    }
+    return dataToBeSigned;
+}
+```
+
+```cpp
+pub extern "C" fn zcash_builder_zip244_shielded_signature_digest(
+    precomputed_tx: *mut PrecomputedTxParts,
+    bundle: *const Bundle<InProgress<Unproven, Unauthorized>, Amount>,
+    sighash_ret: *mut [u8; 32],
+) -> bool {
+    let precomputed_tx = if !precomputed_tx.is_null() {
+        unsafe { Box::from_raw(precomputed_tx) }
+    } else {
+        error!("Invalid precomputed transaction");
+        return false;
+    };
+    if matches!(
+        precomputed_tx.tx.version(),
+        TxVersion::Sprout(_) | TxVersion::Overwinter | TxVersion::Sapling,
+    ) {
+        error!("Cannot calculate ZIP 244 digest for pre-v5 transaction");
+        return false;
+    }
+    let bundle = unsafe { bundle.as_ref().unwrap() };
+
+    struct Signable {}
+    impl Authorization for Signable {
+        type TransparentAuth = TransparentAuth;
+        type SaplingAuth = sapling::Authorized;
+        type OrchardAuth = InProgress<Unproven, Unauthorized>;
+    }
+
+    let txdata: TransactionData<Signable> =
+        precomputed_tx
+            .tx
+            .map_bundles(|b| b, |b| b, |_| Some(bundle.clone()));
+    let txid_parts = txdata.digest(TxIdDigester);
+
+    let sighash = v5_signature_hash(&txdata, &SignableInput::Shielded, &txid_parts);
+
+    // `v5_signature_hash` output is always 32 bytes.
+    *unsafe { &mut *sighash_ret } = sighash.as_ref().try_into().unwrap();
+    true
+}
+```
+
+先看bundle生成，我们可以在[zcash/orchard/src/builder.rs](https://github.com/zcash/orchard/blob/e2bfd99454b171e1a0c9fb3e128f09c023ea9700/src/builder.rs)找到入口，
+
+```rust
+/// Builds the action.
+///
+/// Defined in [Zcash Protocol Spec § 4.7.3: Sending Notes (Orchard)][orchardsend].
+///
+/// [orchardsend]: https://zips.z.cash/protocol/nu5.pdf#orchardsend
+fn build(self, mut rng: impl RngCore) -> (Action<SigningMetadata>, Circuit) {
+    let v_net = self.value_sum();
+    let cv_net = ValueCommitment::derive(v_net, self.rcv.clone());
+
+    let nf_old = self.spend.note.nullifier(&self.spend.fvk);
+    let ak: SpendValidatingKey = self.spend.fvk.clone().into();
+    let alpha = pallas::Scalar::random(&mut rng);
+    let rk = ak.randomize(&alpha);
+
+    let note = Note::new(self.output.recipient, self.output.value, nf_old, &mut rng);
+    let cm_new = note.commitment();
+    let cmx = cm_new.into();
+
+    let encryptor = OrchardNoteEncryption::new(
+        self.output.ovk,
+        note,
+        self.output.recipient,
+        self.output.memo.unwrap_or_else(|| {
+            let mut memo = [0; 512];
+            memo[0] = 0xf6;
+            memo
+        }),
+    );
+
+    let encrypted_note = TransmittedNoteCiphertext {
+        epk_bytes: encryptor.epk().to_bytes().0,
+        enc_ciphertext: encryptor.encrypt_note_plaintext(),
+        out_ciphertext: encryptor.encrypt_outgoing_plaintext(&cv_net, &cmx, &mut rng),
+    };
+
+    (
+        Action::from_parts(
+            nf_old,
+            rk,
+            cmx,
+            encrypted_note,
+            cv_net,
+            SigningMetadata {
+                dummy_ask: self.spend.dummy_sk.as_ref().map(SpendAuthorizingKey::from),
+                parts: SigningParts { ak, alpha },
+            },
+        ),
+        Circuit::from_action_context_unchecked(self.spend, note, alpha, self.rcv),
+    )
+}
+```
+
+## Orchard验证
+
+### 上下文无关验证
+
+### 上下文验证
+
+### 区块连接
+
+## 小结
